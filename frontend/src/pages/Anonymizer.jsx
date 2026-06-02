@@ -154,26 +154,66 @@ function ColorLegend({ types }) {
   );
 }
 
-async function extractText(file) {
+async function extractText(file, onOcrProgress) {
   const ext = file.name.split('.').pop().toLowerCase();
+
   if (ext === 'pdf') {
     const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
     GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
     const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+
+    // First pass: try native text extraction
     const pages = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const page    = await pdf.getPage(i);
       const content = await page.getTextContent();
       pages.push(content.items.map(it => it.str).join(' '));
     }
-    return pages.join('\n\n');
+    const nativeText   = pages.join('\n\n');
+    const meaningfulChars = nativeText.replace(/\s+/g, '').length;
+
+    // If fewer than 50 chars/page on average → scanned document, use OCR
+    if (meaningfulChars / pdf.numPages < 50) {
+      return await runOCR(pdf, onOcrProgress);
+    }
+    return nativeText;
   }
+
   if (ext === 'docx' || ext === 'doc') {
     const mammoth = await import('mammoth');
     const result  = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
     return result.value;
   }
+
   return await file.text();
+}
+
+// OCR for scanned PDFs using Tesseract.js
+async function runOCR(pdfDoc, onProgress) {
+  const { createWorker } = await import('tesseract.js');
+
+  // French + English language models
+  const worker = await createWorker(['fra', 'eng'], 1, {
+    logger: () => {}, // suppress verbose internal logs
+  });
+
+  const pages = [];
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    onProgress?.({ page: i, total: pdfDoc.numPages });
+
+    const page     = await pdfDoc.getPage(i);
+    const viewport = page.getViewport({ scale: 2.5 }); // high-res for OCR accuracy
+    const canvas   = document.createElement('canvas');
+    canvas.width   = viewport.width;
+    canvas.height  = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+    const { data: { text } } = await worker.recognize(canvas);
+    pages.push(text.trim());
+  }
+
+  await worker.terminate();
+  return pages.join('\n\n');
 }
 
 function formatBytes(b) {
@@ -227,6 +267,9 @@ export default function Anonymizer() {
   const [fileSize, setFileSize] = useState(0);
   const [fileExt, setFileExt]   = useState('');
   const [originalFile, setOriginalFile] = useState(null);
+
+  // OCR state
+  const [ocrState, setOcrState] = useState(null); // null | { page, total }
 
   // Categories
   const [categories, setCategories] = useState(['persons', 'numbers', 'addresses', 'emails']);
@@ -285,8 +328,10 @@ export default function Anonymizer() {
   async function handleFile(file) {
     if (!file) return;
     setError('');
+    setOcrState(null);
     try {
-      const extracted = await extractText(file);
+      const extracted = await extractText(file, (progress) => setOcrState(progress));
+      setOcrState(null);
       setText(extracted);
       setFilename(file.name);
       setFileSize(file.size);
@@ -296,6 +341,7 @@ export default function Anonymizer() {
       setExcluded(new Set());
       setStep('ready');
     } catch (err) {
+      setOcrState(null);
       setError(`Impossible de lire ce fichier : ${err.message}`);
     }
   }
@@ -1166,6 +1212,25 @@ export default function Anonymizer() {
             </div>
           )}
         </>
+      )}
+
+      {/* OCR overlay */}
+      {ocrState && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-2xl px-8 py-7 w-80 text-center">
+            <div className="w-12 h-12 rounded-full bg-ink flex items-center justify-center mx-auto mb-4">
+              <Spinner className="w-6 h-6 text-white" />
+            </div>
+            <p className="text-sm font-semibold text-ink mb-1">Lecture OCR en cours…</p>
+            <p className="text-xs text-ink-400 mb-4">
+              Document scanné détecté · page {ocrState.page} / {ocrState.total}
+            </p>
+            <ProgressBar progress={Math.round((ocrState.page / ocrState.total) * 100)} />
+            <p className="text-[11px] text-ink-400 mt-3 leading-relaxed">
+              Extraction du texte par reconnaissance optique (Tesseract OCR — français + anglais)
+            </p>
+          </div>
+        </div>
       )}
 
       {/* Exporting overlay */}
