@@ -226,6 +226,7 @@ export default function Anonymizer() {
   const [filename, setFilename] = useState('');
   const [fileSize, setFileSize] = useState(0);
   const [fileExt, setFileExt]   = useState('');
+  const [originalFile, setOriginalFile] = useState(null);
 
   // Categories
   const [categories, setCategories] = useState(['persons', 'numbers', 'addresses', 'emails']);
@@ -241,6 +242,7 @@ export default function Anonymizer() {
   // View
   const [viewMode, setViewMode]       = useState('sidebyside'); // sidebyside | diff
   const [showExport, setShowExport]   = useState(false);
+  const [exporting, setExporting]     = useState(false);
   const exportRef                     = useRef(null);
 
   // Fake progress
@@ -289,6 +291,7 @@ export default function Anonymizer() {
       setFilename(file.name);
       setFileSize(file.size);
       setFileExt(file.name.split('.').pop().toUpperCase());
+      setOriginalFile(file);
       setResult(null);
       setExcluded(new Set());
       setStep('ready');
@@ -339,6 +342,7 @@ export default function Anonymizer() {
     setStep('idle');
     setText('');
     setFilename('');
+    setOriginalFile(null);
     setResult(null);
     setError('');
     setExcluded(new Set());
@@ -360,9 +364,54 @@ export default function Anonymizer() {
     triggerDownload(URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' })), fname);
   }
 
-  async function exportDocx(textContent = null, name = null) {
-    const content = textContent ?? getFinalAnonymized();
-    const fname   = (name ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
+  // Build sorted mapping for export (longest first, respecting exclusions)
+  function getMappingToApply(mappingArg, excludedArg) {
+    return (mappingArg ?? result.mapping)
+      .filter(m => m.original && m.anonymized && !(excludedArg ?? excluded).has(m.original))
+      .sort((a, b) => b.original.length - a.original.length);
+  }
+
+  // ── DOCX: preserve original formatting via XML replacement ──
+  async function exportDocx(fileArg, mappingArg, excludedArg, nameArg) {
+    const file    = fileArg ?? originalFile;
+    const fname   = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
+    const toApply = getMappingToApply(mappingArg, excludedArg);
+
+    // If we have the original DOCX file, do in-place XML replacement
+    if (file && /\.(docx|doc)$/i.test(file.name)) {
+      setExporting(true);
+      try {
+        const JSZip = (await import('jszip')).default;
+        const zip   = await JSZip.loadAsync(await file.arrayBuffer());
+
+        const targets = Object.keys(zip.files).filter(p =>
+          /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(p)
+        );
+
+        for (const path of targets) {
+          let xml = await zip.files[path].async('string');
+          for (const item of toApply) {
+            const orig = item.original.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            const anon = item.anonymized.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            xml = xml.split(orig).join(anon);
+          }
+          zip.file(path, xml);
+        }
+
+        const blob = await zip.generateAsync({
+          type: 'blob',
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          compression: 'DEFLATE',
+        });
+        triggerDownload(URL.createObjectURL(blob), fname);
+      } finally {
+        setExporting(false);
+      }
+      return;
+    }
+
+    // Fallback: generate plain DOCX from anonymized text
+    const content = getFinalAnonymized();
     const { Document, Paragraph, TextRun, Packer } = await import('docx');
     const doc = new Document({
       sections: [{ children: content.split('\n').map(l => new Paragraph({ children: [new TextRun(l || ' ')] })) }],
@@ -370,9 +419,76 @@ export default function Anonymizer() {
     triggerDownload(URL.createObjectURL(await Packer.toBlob(doc)), fname);
   }
 
-  async function exportPdf(textContent = null, name = null) {
-    const content = textContent ?? getFinalAnonymized();
-    const fname   = (name ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
+  // ── PDF: render each page to canvas, white-out + overlay replacement text ──
+  async function exportPdf(fileArg, mappingArg, excludedArg, nameArg) {
+    const file    = fileArg ?? originalFile;
+    const fname   = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
+    const toApply = getMappingToApply(mappingArg, excludedArg);
+
+    if (file && /\.pdf$/i.test(file.name)) {
+      setExporting(true);
+      try {
+        const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
+        const { jsPDF } = await import('jspdf');
+        GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
+
+        const pdfDoc = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+        const SCALE  = 2;
+
+        // Use first page size for the jsPDF document
+        const pg1      = await pdfDoc.getPage(1);
+        const { width: pgW, height: pgH } = pg1.getViewport({ scale: 1 });
+        const doc = new jsPDF({ unit: 'pt', format: [pgW, pgH], orientation: pgW > pgH ? 'landscape' : 'portrait' });
+
+        for (let n = 1; n <= pdfDoc.numPages; n++) {
+          const page     = await pdfDoc.getPage(n);
+          const viewport = page.getViewport({ scale: SCALE });
+
+          const canvas  = document.createElement('canvas');
+          canvas.width  = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+
+          await page.render({ canvasContext: ctx, viewport }).promise;
+
+          const textContent = await page.getTextContent();
+
+          for (const item of textContent.items) {
+            if (!item.str?.trim()) continue;
+            let newStr = item.str;
+            for (const m of toApply) newStr = newStr.split(m.original).join(m.anonymized);
+            if (newStr === item.str) continue;
+
+            const [cx, cy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
+            const fsize    = (item.height || Math.abs(item.transform[3])) * SCALE;
+            const twidth   = item.width * SCALE;
+
+            // Erase original text
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(cx - 1, cy - fsize * 0.9, twidth + 4, fsize * 1.15);
+
+            // Draw replacement
+            ctx.fillStyle = '#000000';
+            ctx.font = `${fsize}px Arial, Helvetica, sans-serif`;
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(newStr, cx, cy);
+          }
+
+          const imgData = canvas.toDataURL('image/png');
+          const { width: pw, height: ph } = page.getViewport({ scale: 1 });
+          if (n > 1) doc.addPage([pw, ph]);
+          doc.addImage(imgData, 'PNG', 0, 0, pw, ph);
+        }
+
+        doc.save(fname);
+      } finally {
+        setExporting(false);
+      }
+      return;
+    }
+
+    // Fallback: generate plain PDF from anonymized text
+    const content = getFinalAnonymized();
     const { jsPDF } = await import('jspdf');
     const doc    = new jsPDF({ unit: 'mm', format: 'a4' });
     const margin = 20;
@@ -381,22 +497,8 @@ export default function Anonymizer() {
     const textW  = pageW - 2 * margin;
     const lineH  = 6.5;
     let y = margin;
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(13);
-    doc.text((name ?? filename).replace(/\.[^.]+$/, ''), margin, y);
-    y += 7;
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(130, 120, 110);
-    doc.text(`Document anonymise  ·  ${new Date().toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' })}`, margin, y);
-    y += 4;
-    doc.setDrawColor(220, 215, 205);
-    doc.line(margin, y, pageW - margin, y);
-    y += 9;
-    doc.setTextColor(13, 12, 11);
     doc.setFontSize(11);
-
     for (const para of content.split('\n')) {
       if (para.trim() === '') { y += 3.5; continue; }
       for (const line of doc.splitTextToSize(para, textW)) {
@@ -534,9 +636,15 @@ export default function Anonymizer() {
                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
                 </button>
                 {showExport && (
-                  <div className="absolute right-0 top-full mt-1.5 bg-white border border-cream-300 rounded-xl shadow-lg z-20 overflow-hidden min-w-[9rem]">
-                    <button onClick={() => { exportPdf();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors">PDF</button>
-                    <button onClick={() => { exportDocx(); setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">DOCX</button>
+                  <div className="absolute right-0 top-full mt-1.5 bg-white border border-cream-300 rounded-xl shadow-lg z-20 overflow-hidden min-w-[11rem]">
+                    <button onClick={() => { exportPdf();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors flex items-center justify-between gap-3">
+                      <span>PDF</span>
+                      {/\.pdf$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page conservée</span>}
+                    </button>
+                    <button onClick={() => { exportDocx(); setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200 flex items-center justify-between gap-3">
+                      <span>DOCX</span>
+                      {/\.(docx|doc)$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page conservée</span>}
+                    </button>
                     <button onClick={() => { exportTxt();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">TXT</button>
                   </div>
                 )}
@@ -621,7 +729,13 @@ export default function Anonymizer() {
                     key={item.id}
                     item={item}
                     onRemove={id => setQueue(q => q.filter(i => i.id !== id))}
-                    onExport={it => exportPdf(it.result.anonymized, it.filename)}
+                    onExport={it => {
+                    const ext = it.filename.split('.').pop().toLowerCase();
+                    const m   = it.result.mapping;
+                    if (ext === 'pdf')              exportPdf(it.file, m, new Set(), it.filename);
+                    else if (ext === 'docx' || ext === 'doc') exportDocx(it.file, m, new Set(), it.filename);
+                    else exportTxt(it.result.anonymized, it.filename);
+                  }}
                   />
                 ))}
               </div>
@@ -864,6 +978,19 @@ export default function Anonymizer() {
             </div>
           )}
         </>
+      )}
+
+      {/* Exporting overlay */}
+      {exporting && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-2xl shadow-2xl px-8 py-6 flex items-center gap-4">
+            <Spinner className="w-5 h-5 text-ink" />
+            <div>
+              <p className="text-sm font-semibold text-ink">Génération du document…</p>
+              <p className="text-xs text-ink-400 mt-0.5">Mise en page originale conservée</p>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -10,6 +10,7 @@
   "dependencies": {
     "docx": "^8.5.0",
     "jspdf": "^4.2.1",
+    "jszip": "^3.10.1",
     "mammoth": "^1.7.2",
     "pdfjs-dist": "^6.0.227",
     "react": "^18.3.1",
