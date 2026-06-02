@@ -34,6 +34,10 @@ function initDatabase() {
     );
   `);
 
+  // Migrations — add columns silently if they don't exist yet
+  try { db.exec("ALTER TABLE history ADD COLUMN duration_ms INTEGER DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE history ADD COLUMN entity_types TEXT DEFAULT '{}'"); } catch {}
+
   const admin = db.prepare("SELECT id FROM users WHERE email = ?").get('admin@entreprise.fr');
   if (!admin) {
     const hash = bcrypt.hashSync('Admin1234!', 12);
