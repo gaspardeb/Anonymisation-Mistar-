@@ -364,30 +364,258 @@ export default function Anonymizer() {
     triggerDownload(URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' })), fname);
   }
 
-  // Build sorted mapping for export (longest first, respecting exclusions)
   function getMappingToApply(mappingArg, excludedArg) {
     return (mappingArg ?? result.mapping)
       .filter(m => m.original && m.anonymized && !(excludedArg ?? excluded).has(m.original))
       .sort((a, b) => b.original.length - a.original.length);
   }
 
-  // ── DOCX: preserve original formatting via XML replacement ──
-  async function exportDocx(fileArg, mappingArg, excludedArg, nameArg) {
-    const file    = fileArg ?? originalFile;
-    const fname   = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
-    const toApply = getMappingToApply(mappingArg, excludedArg);
+  // Detects document structure from plain text
+  function detectLineType(line) {
+    const t = line.trim();
+    if (!t) return 'empty';
+    if (t.length > 2 && t.length < 65 && t === t.toUpperCase() && /[A-ZÀÉÈÊËÎÏÔÙÛÜ]{3}/.test(t))
+      return 'h1';
+    if (/^(Article|Section|Chapitre|Annexe|Titre|ARTICLE|SECTION)\s/i.test(t) ||
+        /^\d+[.\)]\s+[A-ZÀÉÈÊËÎÏÔÙÛÜ]/.test(t))
+      return 'h2';
+    if (/^[-•*]\s/.test(t) || /^\d+\.\s/.test(t))
+      return 'list';
+    return 'body';
+  }
 
-    // If we have the original DOCX file, do in-place XML replacement
-    if (file && /\.(docx|doc)$/i.test(file.name)) {
-      setExporting(true);
-      try {
+  // ── Professional PDF ──────────────────────────────────────
+  async function buildProfessionalPdf(content, docTitle, entityCount, outputName) {
+    const { jsPDF } = await import('jspdf');
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const PW = doc.internal.pageSize.getWidth();
+    const PH = doc.internal.pageSize.getHeight();
+    const ML = 22, MR = 22, MB = 22;
+    const CW = PW - ML - MR;
+    const dateStr = new Date().toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
+    let pageNum = 1;
+    let y = 0;
+
+    function drawPageChrome(isFirst) {
+      // ── Header bar ──────────────────────────
+      doc.setFillColor(20, 18, 15);
+      doc.rect(0, 0, PW, 10, 'F');
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.5);
+      doc.setTextColor(190, 185, 175);
+      doc.text(docTitle.length > 55 ? docTitle.slice(0, 53) + '…' : docTitle, ML, 6.5);
+      doc.text('MistarAnonyme · DOCUMENT ANONYMISÉ', PW - MR, 6.5, { align: 'right' });
+
+      if (isFirst) {
+        // ── Title block (first page only) ────
+        doc.setFillColor(248, 246, 242);
+        doc.rect(0, 10, PW, 30, 'F');
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(15);
+        doc.setTextColor(20, 18, 15);
+        const tDisplay = docTitle.length > 50 ? docTitle.slice(0, 48) + '…' : docTitle;
+        doc.text(tDisplay, ML, 23);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.setTextColor(110, 100, 90);
+        doc.text(
+          `Document anonymisé · ${entityCount} entité${entityCount !== 1 ? 's' : ''} masquée${entityCount !== 1 ? 's' : ''} · ${dateStr}`,
+          ML, 32
+        );
+
+        // Green badge
+        doc.setFillColor(209, 250, 229);
+        doc.roundedRect(PW - MR - 34, 15.5, 34, 8, 1.5, 1.5, 'F');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(6.5);
+        doc.setTextColor(4, 120, 87);
+        doc.text('✓  ANONYMISÉ', PW - MR - 17, 20.5, { align: 'center' });
+
+        y = 48;
+      } else {
+        y = 18;
+      }
+
+      // ── Footer ──────────────────────────────
+      doc.setDrawColor(215, 210, 200);
+      doc.setLineWidth(0.2);
+      doc.line(ML, PH - MB, PW - MR, PH - MB);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7.5);
+      doc.setTextColor(140, 130, 120);
+      doc.text(dateStr, ML, PH - MB + 4.5);
+      doc.text(String(pageNum), PW / 2, PH - MB + 4.5, { align: 'center' });
+      doc.text('MistarAnonyme', PW - MR, PH - MB + 4.5, { align: 'right' });
+    }
+
+    function checkPageBreak(needed) {
+      if (y + needed > PH - MB - 8) {
+        doc.addPage();
+        pageNum++;
+        drawPageChrome(false);
+      }
+    }
+
+    drawPageChrome(true);
+
+    for (const line of content.split('\n')) {
+      const type = detectLineType(line);
+
+      if (type === 'empty') { y += 2.5; continue; }
+
+      if (type === 'h1') {
+        y += 5;
+        checkPageBreak(14);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(12);
+        doc.setTextColor(20, 18, 15);
+        doc.text(line.trim(), ML, y);
+        y += 2;
+        doc.setDrawColor(20, 18, 15);
+        doc.setLineWidth(0.4);
+        doc.line(ML, y, ML + Math.min(CW, doc.getTextWidth(line.trim()) + 2), y);
+        y += 6;
+        continue;
+      }
+
+      if (type === 'h2') {
+        y += 3.5;
+        checkPageBreak(10);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(10.5);
+        doc.setTextColor(35, 33, 30);
+        doc.text(line.trim(), ML, y);
+        y += 5.5;
+        continue;
+      }
+
+      // body / list
+      const indent = type === 'list' ? ML + 4 : ML;
+      const width  = type === 'list' ? CW - 4 : CW;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10.5);
+      doc.setTextColor(28, 26, 23);
+      for (const wl of doc.splitTextToSize(line, width)) {
+        checkPageBreak(6);
+        doc.text(wl, indent, y);
+        y += 5.6;
+      }
+      y += 1.2;
+    }
+
+    doc.save(outputName);
+  }
+
+  // ── Professional DOCX ─────────────────────────────────────
+  async function buildProfessionalDocx(content, docTitle, entityCount, outputName) {
+    const {
+      Document, Paragraph, TextRun, Packer,
+      Header, Footer, AlignmentType, PageNumber,
+      BorderStyle, convertMillimetersToTwip,
+    } = await import('docx');
+
+    const dateStr = new Date().toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
+    const mm = convertMillimetersToTwip;
+
+    const children = [
+      // Title
+      new Paragraph({
+        children: [new TextRun({ text: docTitle, bold: true, font: 'Calibri', size: 40, color: '0D0C0B' })],
+        spacing: { before: 0, after: 160 },
+      }),
+      new Paragraph({
+        children: [new TextRun({
+          text: `Document anonymisé · ${entityCount} entité${entityCount !== 1 ? 's' : ''} masquée${entityCount !== 1 ? 's' : ''} · ${dateStr}`,
+          font: 'Calibri', size: 18, color: '888888', italics: true,
+        })],
+        spacing: { before: 0, after: 480 },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: 'E0DDD8', space: 8 } },
+      }),
+      // Body
+      ...content.split('\n').map(line => {
+        const type    = detectLineType(line);
+        const trimmed = line.trim();
+        if (type === 'empty') {
+          return new Paragraph({ children: [new TextRun('')], spacing: { before: 0, after: 80 } });
+        }
+        if (type === 'h1') {
+          return new Paragraph({
+            children: [new TextRun({ text: trimmed, bold: true, font: 'Calibri', size: 28, color: '0D0C0B' })],
+            spacing: { before: 400, after: 120 },
+            border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: 'BBBBBB', space: 4 } },
+          });
+        }
+        if (type === 'h2') {
+          return new Paragraph({
+            children: [new TextRun({ text: trimmed, bold: true, font: 'Calibri', size: 24, color: '1A1918' })],
+            spacing: { before: 280, after: 80 },
+          });
+        }
+        return new Paragraph({
+          children: [new TextRun({ text: line, font: 'Calibri', size: 22, color: '1C1A18' })],
+          spacing: { before: 0, after: 100, line: 310 },
+          indent: type === 'list' ? { left: mm(6) } : undefined,
+        });
+      }),
+    ];
+
+    const docObj = new Document({
+      sections: [{
+        properties: {
+          page: { margin: { top: mm(25), bottom: mm(25), left: mm(28), right: mm(22) } },
+        },
+        headers: {
+          default: new Header({
+            children: [new Paragraph({
+              children: [
+                new TextRun({ text: docTitle, bold: true, font: 'Calibri', size: 16, color: '444444' }),
+                new TextRun({ text: '  ·  Document anonymisé', font: 'Calibri', size: 16, color: '999999' }),
+              ],
+              border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: 'E0DDD8', space: 4 } },
+            })],
+          }),
+        },
+        footers: {
+          default: new Footer({
+            children: [new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                new TextRun({ text: `${dateStr}  ·  MistarAnonyme  ·  Page `, font: 'Calibri', size: 16, color: '999999' }),
+                new TextRun({ children: [PageNumber.CURRENT], font: 'Calibri', size: 16, color: '999999' }),
+                new TextRun({ text: ' / ', font: 'Calibri', size: 16, color: '999999' }),
+                new TextRun({ children: [PageNumber.TOTAL_PAGES], font: 'Calibri', size: 16, color: '999999' }),
+              ],
+              border: { top: { style: BorderStyle.SINGLE, size: 4, color: 'E0DDD8', space: 4 } },
+            })],
+          }),
+        },
+        children,
+      }],
+    });
+
+    triggerDownload(URL.createObjectURL(await Packer.toBlob(docObj)), outputName);
+  }
+
+  // ── exportDocx: DOCX-source → XML replacement; otherwise professional template ──
+  async function exportDocx(fileArg, mappingArg, excludedArg, nameArg, textArg) {
+    const file      = fileArg ?? originalFile;
+    const fname     = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
+    const toApply   = getMappingToApply(mappingArg, excludedArg);
+    const rawText   = textArg ?? getFinalAnonymized();
+    const docTitle  = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+    const entityCount = toApply.length;
+
+    setExporting(true);
+    try {
+      if (file && /\.(docx|doc)$/i.test(file.name)) {
+        // In-place XML replacement → preserves original Word formatting
         const JSZip = (await import('jszip')).default;
         const zip   = await JSZip.loadAsync(await file.arrayBuffer());
-
         const targets = Object.keys(zip.files).filter(p =>
           /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(p)
         );
-
         for (const path of targets) {
           let xml = await zip.files[path].async('string');
           for (const item of toApply) {
@@ -397,117 +625,76 @@ export default function Anonymizer() {
           }
           zip.file(path, xml);
         }
-
-        const blob = await zip.generateAsync({
-          type: 'blob',
-          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          compression: 'DEFLATE',
-        });
+        const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', compression: 'DEFLATE' });
         triggerDownload(URL.createObjectURL(blob), fname);
-      } finally {
-        setExporting(false);
+      } else {
+        // Professional DOCX template
+        await buildProfessionalDocx(rawText, docTitle, entityCount, fname);
       }
-      return;
+    } finally {
+      setExporting(false);
     }
-
-    // Fallback: generate plain DOCX from anonymized text
-    const content = getFinalAnonymized();
-    const { Document, Paragraph, TextRun, Packer } = await import('docx');
-    const doc = new Document({
-      sections: [{ children: content.split('\n').map(l => new Paragraph({ children: [new TextRun(l || ' ')] })) }],
-    });
-    triggerDownload(URL.createObjectURL(await Packer.toBlob(doc)), fname);
   }
 
-  // ── PDF: render each page to canvas, white-out + overlay replacement text ──
-  async function exportPdf(fileArg, mappingArg, excludedArg, nameArg) {
-    const file    = fileArg ?? originalFile;
-    const fname   = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
-    const toApply = getMappingToApply(mappingArg, excludedArg);
+  // ── exportPdf: PDF-source → canvas overlay; otherwise professional template ──
+  async function exportPdf(fileArg, mappingArg, excludedArg, nameArg, textArg) {
+    const file      = fileArg ?? originalFile;
+    const fname     = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
+    const toApply   = getMappingToApply(mappingArg, excludedArg);
+    const rawText   = textArg ?? getFinalAnonymized();
+    const docTitle  = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+    const entityCount = toApply.length;
 
-    if (file && /\.pdf$/i.test(file.name)) {
-      setExporting(true);
-      try {
+    setExporting(true);
+    try {
+      if (file && /\.pdf$/i.test(file.name)) {
+        // Canvas-based overlay → preserves original PDF visual layout
         const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
         const { jsPDF } = await import('jspdf');
         GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
-
         const pdfDoc = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
         const SCALE  = 2;
-
-        // Use first page size for the jsPDF document
-        const pg1      = await pdfDoc.getPage(1);
+        const pg1    = await pdfDoc.getPage(1);
         const { width: pgW, height: pgH } = pg1.getViewport({ scale: 1 });
         const doc = new jsPDF({ unit: 'pt', format: [pgW, pgH], orientation: pgW > pgH ? 'landscape' : 'portrait' });
 
         for (let n = 1; n <= pdfDoc.numPages; n++) {
           const page     = await pdfDoc.getPage(n);
           const viewport = page.getViewport({ scale: SCALE });
-
-          const canvas  = document.createElement('canvas');
-          canvas.width  = viewport.width;
-          canvas.height = viewport.height;
+          const canvas   = document.createElement('canvas');
+          canvas.width   = viewport.width;
+          canvas.height  = viewport.height;
           const ctx = canvas.getContext('2d');
-
           await page.render({ canvasContext: ctx, viewport }).promise;
 
-          const textContent = await page.getTextContent();
-
-          for (const item of textContent.items) {
+          for (const item of (await page.getTextContent()).items) {
             if (!item.str?.trim()) continue;
             let newStr = item.str;
             for (const m of toApply) newStr = newStr.split(m.original).join(m.anonymized);
             if (newStr === item.str) continue;
-
             const [cx, cy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
-            const fsize    = (item.height || Math.abs(item.transform[3])) * SCALE;
-            const twidth   = item.width * SCALE;
-
-            // Erase original text
+            const fsize  = (item.height || Math.abs(item.transform[3])) * SCALE;
+            const twidth = item.width * SCALE;
             ctx.fillStyle = '#ffffff';
-            ctx.fillRect(cx - 1, cy - fsize * 0.9, twidth + 4, fsize * 1.15);
-
-            // Draw replacement
+            ctx.fillRect(cx - 1, cy - fsize * 0.92, twidth + 4, fsize * 1.18);
             ctx.fillStyle = '#000000';
             ctx.font = `${fsize}px Arial, Helvetica, sans-serif`;
             ctx.textBaseline = 'alphabetic';
             ctx.fillText(newStr, cx, cy);
           }
 
-          const imgData = canvas.toDataURL('image/png');
           const { width: pw, height: ph } = page.getViewport({ scale: 1 });
           if (n > 1) doc.addPage([pw, ph]);
-          doc.addImage(imgData, 'PNG', 0, 0, pw, ph);
+          doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pw, ph);
         }
-
         doc.save(fname);
-      } finally {
-        setExporting(false);
+      } else {
+        // Professional PDF template
+        await buildProfessionalPdf(rawText, docTitle, entityCount, fname);
       }
-      return;
+    } finally {
+      setExporting(false);
     }
-
-    // Fallback: generate plain PDF from anonymized text
-    const content = getFinalAnonymized();
-    const { jsPDF } = await import('jspdf');
-    const doc    = new jsPDF({ unit: 'mm', format: 'a4' });
-    const margin = 20;
-    const pageW  = doc.internal.pageSize.getWidth();
-    const pageH  = doc.internal.pageSize.getHeight();
-    const textW  = pageW - 2 * margin;
-    const lineH  = 6.5;
-    let y = margin;
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(11);
-    for (const para of content.split('\n')) {
-      if (para.trim() === '') { y += 3.5; continue; }
-      for (const line of doc.splitTextToSize(para, textW)) {
-        if (y + lineH > pageH - margin) { doc.addPage(); y = margin; }
-        doc.text(line, margin, y);
-        y += lineH;
-      }
-    }
-    doc.save(fname);
   }
 
   // ── Multi-doc handlers ────────────────────────────────────
@@ -732,9 +919,10 @@ export default function Anonymizer() {
                     onExport={it => {
                     const ext = it.filename.split('.').pop().toLowerCase();
                     const m   = it.result.mapping;
-                    if (ext === 'pdf')              exportPdf(it.file, m, new Set(), it.filename);
-                    else if (ext === 'docx' || ext === 'doc') exportDocx(it.file, m, new Set(), it.filename);
-                    else exportTxt(it.result.anonymized, it.filename);
+                    const t   = it.result.anonymized;
+                    if (ext === 'pdf')                        exportPdf(it.file, m, new Set(), it.filename, t);
+                    else if (ext === 'docx' || ext === 'doc') exportDocx(it.file, m, new Set(), it.filename, t);
+                    else                                      exportTxt(t, it.filename);
                   }}
                   />
                 ))}
