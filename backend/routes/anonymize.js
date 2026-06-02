@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { anonymizationRateLimit } = require('../middleware/rateLimit');
 const db = require('../db/database');
+const { normalizeEntityType } = require('../utils/normalizeTypes');
 
 const router = express.Router();
 
@@ -50,9 +51,18 @@ router.post('/', requireAuth, anonymizationRateLimit, async (req, res) => {
     .map(c => CATEGORY_RULES[c])
     .join('\n');
 
+  const typeHints = categories
+    .filter(c => CATEGORY_RULES[c])
+    .map(c => `"${c}"`)
+    .join(', ');
+
   const prompt = `Tu es un expert en anonymisation RGPD. Anonymise le texte suivant en remplaçant toutes les données identifiantes selon ces règles :
 ${rules}
-RÈGLES IMPORTANTES : cohérence des substituts (même personne = même code partout), numérotation séquentielle, conserver la structure et la mise en forme du texte.
+RÈGLES IMPORTANTES :
+- Cohérence des substituts : même entité = même code partout dans le texte
+- Numérotation séquentielle pour chaque type
+- Conserver la structure et la mise en forme du texte
+- Dans le mapping, le champ "type" doit être EXACTEMENT l'une de ces valeurs : ${typeHints}
 Réponds UNIQUEMENT avec un JSON valide, sans markdown, sans backticks :
 {"anonymized":"...","mapping":[{"original":"...","anonymized":"...","type":"..."}]}
 
@@ -97,7 +107,8 @@ ${text}`;
     const entityCount = mapping.length;
     const entityTypes = {};
     for (const item of mapping) {
-      if (item.type) entityTypes[item.type] = (entityTypes[item.type] || 0) + 1;
+      const key = normalizeEntityType(item.type);
+      if (key) entityTypes[key] = (entityTypes[key] || 0) + 1;
     }
 
     const safeFilename = (filename || 'sans_nom.txt').slice(0, 255);
