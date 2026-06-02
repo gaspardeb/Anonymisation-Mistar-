@@ -55,7 +55,7 @@ export default function Login() {
 
         {/* Brand */}
         <div className="text-center mb-10">
-          <p className="font-display text-4xl text-ink">Anonymis</p>
+          <p className="font-display text-4xl text-ink">MistarAnonyme</p>
           <p className="text-sm text-ink-500 mt-1 tracking-wide">
             {mustChange ? 'Sécurisez votre compte' : 'Plateforme d\'anonymisation RGPD'}
           </p>

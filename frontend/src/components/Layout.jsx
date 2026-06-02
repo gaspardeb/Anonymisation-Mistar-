@@ -51,7 +51,7 @@ export default function Layout() {
 
         {/* Brand */}
         <div className="px-5 py-5 border-b border-cream-200">
-          <p className="font-display text-xl text-ink tracking-tight">Anonymis</p>
+          <p className="font-display text-xl text-ink tracking-tight">MistarAnonyme</p>
           <p className="text-[10px] text-ink-400 mt-0.5 uppercase tracking-widest">Plateforme RGPD</p>
         </div>
 
