@@ -12,6 +12,33 @@ function audit(userId, action, details, ip) {
   ).run(userId, action, details, ip);
 }
 
+// POST /api/auth/register
+router.post('/register', (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email et mot de passe requis' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'Mot de passe trop court (min. 8 caractères)' });
+  }
+
+  const normalized = email.toLowerCase().trim();
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalized);
+  if (existing) {
+    return res.status(409).json({ error: 'Un compte existe déjà avec cet email' });
+  }
+
+  const hash = bcrypt.hashSync(password, 12);
+  const result = db.prepare(
+    "INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'user')"
+  ).run(normalized, hash);
+
+  audit(result.lastInsertRowid, 'CREATE_ACCOUNT', `Inscription : ${normalized}`, req.ip);
+
+  res.status(201).json({ message: 'Compte créé avec succès' });
+});
+
 // POST /api/auth/login
 router.post('/login', (req, res) => {
   const { email, password } = req.body;
