@@ -644,98 +644,86 @@ export default function Anonymizer() {
     triggerDownload(URL.createObjectURL(await Packer.toBlob(docObj)), outputName);
   }
 
-  // ── exportDocx: DOCX-source → XML replacement; otherwise professional template ──
+  // ── exportDocx: professional template (reliable across all DOCX structures) ──
   async function exportDocx(fileArg, mappingArg, excludedArg, nameArg, textArg) {
-    const file      = fileArg ?? originalFile;
-    const fname     = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
-    const toApply   = getMappingToApply(mappingArg, excludedArg);
-    const rawText   = textArg ?? getFinalAnonymized();
-    const docTitle  = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+    const fname       = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.docx');
+    const toApply     = getMappingToApply(mappingArg, excludedArg);
+    const rawText     = textArg ?? getFinalAnonymized();
+    const docTitle    = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
     const entityCount = toApply.length;
 
     setExporting(true);
     try {
-      if (file && /\.(docx|doc)$/i.test(file.name)) {
-        // In-place XML replacement → preserves original Word formatting
-        const JSZip = (await import('jszip')).default;
-        const zip   = await JSZip.loadAsync(await file.arrayBuffer());
-        const targets = Object.keys(zip.files).filter(p =>
-          /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(p)
-        );
-        for (const path of targets) {
-          let xml = await zip.files[path].async('string');
-          for (const item of toApply) {
-            const orig = item.original.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-            const anon = item.anonymized.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-            xml = xml.split(orig).join(anon);
-          }
-          zip.file(path, xml);
-        }
-        const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', compression: 'DEFLATE' });
-        triggerDownload(URL.createObjectURL(blob), fname);
-      } else {
-        // Professional DOCX template
-        await buildProfessionalDocx(rawText, docTitle, entityCount, fname);
-      }
+      await buildProfessionalDocx(rawText, docTitle, entityCount, fname);
     } finally {
       setExporting(false);
     }
   }
 
-  // ── exportPdf: PDF-source → canvas overlay; otherwise professional template ──
+  // ── exportPdf: canvas overlay for native PDFs, professional template for scanned ──
   async function exportPdf(fileArg, mappingArg, excludedArg, nameArg, textArg) {
-    const file      = fileArg ?? originalFile;
-    const fname     = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
-    const toApply   = getMappingToApply(mappingArg, excludedArg);
-    const rawText   = textArg ?? getFinalAnonymized();
-    const docTitle  = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+    const file        = fileArg ?? originalFile;
+    const fname       = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
+    const toApply     = getMappingToApply(mappingArg, excludedArg);
+    const rawText     = textArg ?? getFinalAnonymized();
+    const docTitle    = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
     const entityCount = toApply.length;
 
     setExporting(true);
     try {
       if (file && /\.pdf$/i.test(file.name)) {
-        // Canvas-based overlay → preserves original PDF visual layout
         const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
         const { jsPDF } = await import('jspdf');
         GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
         const pdfDoc = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-        const SCALE  = 2;
-        const pg1    = await pdfDoc.getPage(1);
-        const { width: pgW, height: pgH } = pg1.getViewport({ scale: 1 });
-        const doc = new jsPDF({ unit: 'pt', format: [pgW, pgH], orientation: pgW > pgH ? 'landscape' : 'portrait' });
 
-        for (let n = 1; n <= pdfDoc.numPages; n++) {
-          const page     = await pdfDoc.getPage(n);
-          const viewport = page.getViewport({ scale: SCALE });
-          const canvas   = document.createElement('canvas');
-          canvas.width   = viewport.width;
-          canvas.height  = viewport.height;
-          const ctx = canvas.getContext('2d');
-          await page.render({ canvasContext: ctx, viewport }).promise;
+        // Detect whether PDF has native selectable text (vs scanned image)
+        const pg1Content = await (await pdfDoc.getPage(1)).getTextContent();
+        const hasNativeText = pg1Content.items.some(it => it.str?.trim().length > 0);
 
-          for (const item of (await page.getTextContent()).items) {
-            if (!item.str?.trim()) continue;
-            let newStr = item.str;
-            for (const m of toApply) newStr = newStr.split(m.original).join(m.anonymized);
-            if (newStr === item.str) continue;
-            const [cx, cy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
-            const fsize  = (item.height || Math.abs(item.transform[3])) * SCALE;
-            const twidth = item.width * SCALE;
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(cx - 1, cy - fsize * 0.92, twidth + 4, fsize * 1.18);
-            ctx.fillStyle = '#000000';
-            ctx.font = `${fsize}px Arial, Helvetica, sans-serif`;
-            ctx.textBaseline = 'alphabetic';
-            ctx.fillText(newStr, cx, cy);
+        if (hasNativeText) {
+          // Canvas overlay — renders original page then replaces entity text in-place
+          const SCALE = 2;
+          const pg1   = await pdfDoc.getPage(1);
+          const { width: pgW, height: pgH } = pg1.getViewport({ scale: 1 });
+          const doc = new jsPDF({ unit: 'pt', format: [pgW, pgH], orientation: pgW > pgH ? 'landscape' : 'portrait' });
+
+          for (let n = 1; n <= pdfDoc.numPages; n++) {
+            const page     = await pdfDoc.getPage(n);
+            const viewport = page.getViewport({ scale: SCALE });
+            const canvas   = document.createElement('canvas');
+            canvas.width   = viewport.width;
+            canvas.height  = viewport.height;
+            const ctx = canvas.getContext('2d');
+            await page.render({ canvasContext: ctx, viewport }).promise;
+
+            for (const item of (await page.getTextContent()).items) {
+              if (!item.str?.trim()) continue;
+              let newStr = item.str;
+              for (const m of toApply) newStr = newStr.split(m.original).join(m.anonymized);
+              if (newStr === item.str) continue;
+              const [cx, cy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
+              const fsize  = (item.height || Math.abs(item.transform[3])) * SCALE;
+              const twidth = item.width * SCALE;
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(cx - 1, cy - fsize * 0.92, twidth + 4, fsize * 1.18);
+              ctx.fillStyle = '#000000';
+              ctx.font = `${fsize}px Arial, Helvetica, sans-serif`;
+              ctx.textBaseline = 'alphabetic';
+              ctx.fillText(newStr, cx, cy);
+            }
+
+            const { width: pw, height: ph } = page.getViewport({ scale: 1 });
+            if (n > 1) doc.addPage([pw, ph]);
+            doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pw, ph);
           }
-
-          const { width: pw, height: ph } = page.getViewport({ scale: 1 });
-          if (n > 1) doc.addPage([pw, ph]);
-          doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pw, ph);
+          doc.save(fname);
+        } else {
+          // Scanned PDF — no selectable text layer, use professional template
+          await buildProfessionalPdf(rawText, docTitle, entityCount, fname);
         }
-        doc.save(fname);
       } else {
-        // Professional PDF template
+        // Non-PDF source → professional template
         await buildProfessionalPdf(rawText, docTitle, entityCount, fname);
       }
     } finally {
@@ -872,11 +860,11 @@ export default function Anonymizer() {
                   <div className="absolute right-0 top-full mt-1.5 bg-white border border-cream-300 rounded-xl shadow-lg z-20 overflow-hidden min-w-[11rem]">
                     <button onClick={() => { exportPdf();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors flex items-center justify-between gap-3">
                       <span>PDF</span>
-                      {/\.pdf$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page conservée</span>}
+                      {/\.pdf$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page originale</span>}
                     </button>
                     <button onClick={() => { exportDocx(); setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200 flex items-center justify-between gap-3">
                       <span>DOCX</span>
-                      {/\.(docx|doc)$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page conservée</span>}
+                      <span className="text-[10px] text-ink-400 font-medium">gabarit professionnel</span>
                     </button>
                     <button onClick={() => { exportTxt();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">TXT</button>
                   </div>
