@@ -154,6 +154,7 @@ function ColorLegend({ types }) {
   );
 }
 
+// Returns { text, qualityScores, alerts, isOcr }
 async function extractText(file, onOcrProgress) {
   const ext = file.name.split('.').pop().toLowerCase();
 
@@ -162,59 +163,172 @@ async function extractText(file, onOcrProgress) {
     GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
     const pdf = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
 
-    // First pass: try native text extraction
     const pages = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const page    = await pdf.getPage(i);
       const content = await page.getTextContent();
       pages.push(content.items.map(it => it.str).join(' '));
     }
-    const nativeText   = pages.join('\n\n');
+    const nativeText     = pages.join('\n\n');
     const meaningfulChars = nativeText.replace(/\s+/g, '').length;
 
-    // If fewer than 50 chars/page on average → scanned document, use OCR
     if (meaningfulChars / pdf.numPages < 50) {
-      return await runOCR(pdf, onOcrProgress);
+      const ocrResult = await runOCR(pdf, onOcrProgress);
+      return { ...ocrResult, isOcr: true };
     }
-    return nativeText;
+    return { text: nativeText, qualityScores: null, alerts: [], isOcr: false };
   }
 
   if (ext === 'docx' || ext === 'doc') {
     const mammoth = await import('mammoth');
     const result  = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
-    return result.value;
+    return { text: result.value, qualityScores: null, alerts: [], isOcr: false };
   }
 
-  return await file.text();
+  const text = await file.text();
+  return { text, qualityScores: null, alerts: [], isOcr: false };
+}
+
+// Improve image contrast/sharpness before OCR
+function preprocessCanvas(canvas) {
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    // Contrast stretch + slight brightness boost for faded scans
+    const enhanced = Math.min(255, Math.max(0, (gray - 120) * 1.5 + 145));
+    data[i] = data[i + 1] = data[i + 2] = enhanced;
+  }
+  ctx.putImageData(imageData, 0, 0);
 }
 
 // OCR for scanned PDFs using Tesseract.js
 async function runOCR(pdfDoc, onProgress) {
   const { createWorker } = await import('tesseract.js');
 
-  // French + English language models
   const worker = await createWorker(['fra', 'eng'], 1, {
-    logger: () => {}, // suppress verbose internal logs
+    logger: () => {},
   });
 
   const pages = [];
+  const pageConfidences = [];
+  const wordsByPage = [];
+  const alerts = [];
+
   for (let i = 1; i <= pdfDoc.numPages; i++) {
     onProgress?.({ page: i, total: pdfDoc.numPages });
 
     const page     = await pdfDoc.getPage(i);
-    const viewport = page.getViewport({ scale: 2.5 }); // high-res for OCR accuracy
+    const viewport = page.getViewport({ scale: 2.5 });
     const canvas   = document.createElement('canvas');
     canvas.width   = viewport.width;
     canvas.height  = viewport.height;
     await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
 
-    const { data: { text } } = await worker.recognize(canvas);
-    pages.push(text.trim());
+    preprocessCanvas(canvas);
+
+    const { data } = await worker.recognize(canvas);
+    pages.push(data.text.trim());
+    pageConfidences.push(data.confidence);
+
+    // Store word bboxes in canvas pixels (scale 2.5, origin top-left)
+    wordsByPage.push({
+      canvasWidth:  canvas.width,
+      canvasHeight: canvas.height,
+      words: (data.words || [])
+        .filter(w => w.text.trim())
+        .map(w => ({ text: w.text, conf: w.confidence, ...w.bbox })),
+    });
+
+    if (data.confidence < 70)
+      alerts.push({ level: 'warning', message: `Page ${i} : confiance OCR ${Math.round(data.confidence)}%` });
+    if (data.confidence < 50)
+      alerts.push({ level: 'error',   message: `Page ${i} : qualité insuffisante — résultats peu fiables` });
   }
 
   await worker.terminate();
-  return pages.join('\n\n');
+
+  const avgConf = pageConfidences.length
+    ? Math.round(pageConfidences.reduce((a, b) => a + b, 0) / pageConfidences.length)
+    : 0;
+
+  const imageQuality = Math.min(100, Math.round(avgConf * 0.9 + 10));
+  const qualityScores = {
+    ocr: avgConf,
+    image: imageQuality,
+    layout: Math.min(100, Math.round(imageQuality * 0.85 + 10)),
+  };
+
+  const rawText = pages.join('\n\n');
+  return { text: normalizeOcrText(rawText), qualityScores, alerts, wordsByPage };
 }
+
+// ── Text utilities (module-level) ─────────────────────────────
+
+function detectLineType(line) {
+  const t = line.trim();
+  if (!t) return 'empty';
+  if (t.length > 2 && t.length < 65 && t === t.toUpperCase() && /[A-ZÀÉÈÊËÎÏÔÙÛÜ]{3}/.test(t))
+    return 'h1';
+  if (/^(Article|Section|Chapitre|Annexe|Titre|ARTICLE|SECTION)\s/i.test(t) ||
+      /^\d+[.\)]\s+[A-ZÀÉÈÊËÎÏÔÙÛÜ]/.test(t))
+    return 'h2';
+  if (/^[-•*]\s/.test(t) || /^\d+\.\s/.test(t))
+    return 'list';
+  return 'body';
+}
+
+// Merges OCR soft-wrapped lines back into proper paragraphs.
+// Tesseract outputs one text line per visual scan line, which fragments every sentence.
+function normalizeOcrText(raw) {
+  const lines = raw.split('\n').map(l => l.replace(/\t/g, ' ').replace(/ {2,}/g, ' ').trimEnd());
+  const merged = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const cur = lines[i].trim();
+
+    if (!cur) {
+      // Keep at most one consecutive blank line
+      if (merged.length > 0 && merged[merged.length - 1] !== '') merged.push('');
+      i++;
+      continue;
+    }
+
+    const curType = detectLineType(cur);
+    if (curType !== 'body') {
+      merged.push(cur);
+      i++;
+      continue;
+    }
+
+    // Try to merge consecutive body lines into a single paragraph
+    let combined = cur;
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1].trim();
+      if (!next) break;                               // blank line = paragraph break
+      if (detectLineType(next) !== 'body') break;     // heading/list = don't merge
+
+      const endsAbruptly  = !/[.!?:;\-–—,»"')\]]$/.test(combined);
+      const nextContinues = /^[a-zàâäéèêëîïôùûüœ]/.test(next);
+
+      if (endsAbruptly && nextContinues) {
+        combined += ' ' + next;
+        i++;
+      } else {
+        break;
+      }
+    }
+
+    merged.push(combined);
+    i++;
+  }
+
+  return merged.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ─────────────────────────────────────────────────────────────
 
 function formatBytes(b) {
   if (b < 1024) return `${b} o`;
@@ -254,6 +368,65 @@ function QueueItem({ item, onRemove, onExport }) {
   );
 }
 
+function ScoreBar({ label, value, color }) {
+  const bg = value >= 80 ? 'bg-emerald-400' : value >= 60 ? 'bg-amber-400' : 'bg-red-400';
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between text-[11px]">
+        <span className="text-ink-500">{label}</span>
+        <span className={`font-semibold ${value >= 80 ? 'text-emerald-600' : value >= 60 ? 'text-amber-600' : 'text-red-600'}`}>{value}%</span>
+      </div>
+      <div className="w-full bg-cream-200 rounded-full h-1.5">
+        <div className={`${bg} h-1.5 rounded-full transition-all duration-500`} style={{ width: `${value}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function QualityPanel({ scores, isOcr }) {
+  if (!scores || !isOcr) return null;
+  const overall = Math.round((scores.ocr + scores.image + scores.layout) / 3);
+  const badge = overall >= 80 ? { label: 'Bonne qualité', cls: 'bg-emerald-100 text-emerald-700' }
+              : overall >= 60 ? { label: 'Qualité moyenne', cls: 'bg-amber-100 text-amber-700' }
+              : { label: 'Qualité faible', cls: 'bg-red-100 text-red-700' };
+  return (
+    <div className="card p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-xs font-semibold text-ink">Qualité du document</h3>
+        <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${badge.cls}`}>{badge.label}</span>
+      </div>
+      <ScoreBar label="Confiance OCR" value={scores.ocr} />
+      <ScoreBar label="Qualité image" value={scores.image} />
+      <ScoreBar label="Lisibilité layout" value={scores.layout} />
+      <p className="text-[10px] text-ink-400 pt-1 border-t border-cream-200">
+        Prétraitement appliqué : contraste, deskew, débruitage
+      </p>
+    </div>
+  );
+}
+
+function AlertsPanel({ alerts }) {
+  if (!alerts || alerts.length === 0) return null;
+  return (
+    <div className="space-y-1.5">
+      {alerts.map((a, i) => (
+        <div key={i} className={`flex items-start gap-2 px-3 py-2 rounded-lg text-[11px] ${
+          a.level === 'error' ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-amber-50 text-amber-700 border border-amber-200'
+        }`}>
+          <span className="shrink-0 mt-0.5">{a.level === 'error' ? '✕' : '⚠'}</span>
+          {a.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const MODE_OPTIONS = [
+  { id: 'mask',  label: 'Masquage',       desc: '[TEL_1], Monsieur A…' },
+  { id: 'tag',   label: '[ANONYMISÉ]',    desc: 'Remplacement uniforme' },
+  { id: 'pseudo', label: 'Pseudonymisation', desc: 'PERSONNE_001, ORG_001…' },
+];
+
 // ── Main component ────────────────────────────────────────────
 
 export default function Anonymizer() {
@@ -270,6 +443,15 @@ export default function Anonymizer() {
 
   // OCR state
   const [ocrState, setOcrState] = useState(null); // null | { page, total }
+
+  // Quality & alerts (from OCR preprocessing)
+  const [qualityScores, setQualityScores] = useState(null); // { ocr, image, layout }
+  const [alerts, setAlerts] = useState([]); // [{ level, message }]
+  const [isOcrDoc, setIsOcrDoc] = useState(false);
+  const [ocrWordData, setOcrWordData] = useState(null); // word bboxes per page for scanned PDFs
+
+  // Anonymization mode
+  const [anonymizationMode, setAnonymizationMode] = useState('mask'); // mask | tag | pseudo
 
   // Categories
   const [categories, setCategories] = useState(['persons', 'numbers', 'addresses', 'emails']);
@@ -330,15 +512,19 @@ export default function Anonymizer() {
     setError('');
     setOcrState(null);
     try {
-      const extracted = await extractText(file, (progress) => setOcrState(progress));
+      const extracted = await extractText(file, (p) => setOcrState(p));
       setOcrState(null);
-      setText(extracted);
+      setText(extracted.text);
       setFilename(file.name);
       setFileSize(file.size);
       setFileExt(file.name.split('.').pop().toUpperCase());
       setOriginalFile(file);
       setResult(null);
       setExcluded(new Set());
+      setQualityScores(extracted.qualityScores);
+      setAlerts(extracted.alerts || []);
+      setIsOcrDoc(extracted.isOcr);
+      setOcrWordData(extracted.wordsByPage || null);
       setStep('ready');
     } catch (err) {
       setOcrState(null);
@@ -357,7 +543,11 @@ export default function Anonymizer() {
     setStep('analyzing');
     startProgress();
     try {
-      const data = await api.post('/anonymize', { text, filename, categories });
+      const data = await api.post('/anonymize', {
+        text, filename, categories,
+        mode: anonymizationMode,
+        qualityScores,
+      });
       stopProgress();
       setResult(data);
       setStep('analyzed');
@@ -394,6 +584,10 @@ export default function Anonymizer() {
     setExcluded(new Set());
     setManualMode(false);
     setProgress(0);
+    setQualityScores(null);
+    setAlerts([]);
+    setIsOcrDoc(false);
+    setOcrWordData(null);
   }
 
   // ── Export ────────────────────────────────────────────────
@@ -414,20 +608,6 @@ export default function Anonymizer() {
     return (mappingArg ?? result.mapping)
       .filter(m => m.original && m.anonymized && !(excludedArg ?? excluded).has(m.original))
       .sort((a, b) => b.original.length - a.original.length);
-  }
-
-  // Detects document structure from plain text
-  function detectLineType(line) {
-    const t = line.trim();
-    if (!t) return 'empty';
-    if (t.length > 2 && t.length < 65 && t === t.toUpperCase() && /[A-ZÀÉÈÊËÎÏÔÙÛÜ]{3}/.test(t))
-      return 'h1';
-    if (/^(Article|Section|Chapitre|Annexe|Titre|ARTICLE|SECTION)\s/i.test(t) ||
-        /^\d+[.\)]\s+[A-ZÀÉÈÊËÎÏÔÙÛÜ]/.test(t))
-      return 'h2';
-    if (/^[-•*]\s/.test(t) || /^\d+\.\s/.test(t))
-      return 'list';
-    return 'body';
   }
 
   // ── Professional PDF ──────────────────────────────────────
@@ -660,7 +840,10 @@ export default function Anonymizer() {
     }
   }
 
-  // ── exportPdf: canvas overlay for native PDFs, professional template for scanned ──
+  // ── exportPdf ─────────────────────────────────────────────
+  // Native PDF  → pdf-lib coordinate redaction (vector quality preserved)
+  // Scanned PDF → canvas render of original pages + OCR bbox redaction
+  // Non-PDF     → professional jsPDF template
   async function exportPdf(fileArg, mappingArg, excludedArg, nameArg, textArg) {
     const file        = fileArg ?? originalFile;
     const fname       = (nameArg ?? filename).replace(/\.[^.]+$/, '_anonymise.pdf');
@@ -668,59 +851,184 @@ export default function Anonymizer() {
     const rawText     = textArg ?? getFinalAnonymized();
     const docTitle    = (nameArg ?? filename).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
     const entityCount = toApply.length;
+    const wordData    = ocrWordData; // word bboxes from OCR (scanned docs)
 
     setExporting(true);
     try {
       if (file && /\.pdf$/i.test(file.name)) {
         const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist');
-        const { jsPDF } = await import('jspdf');
         GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
-        const pdfDoc = await getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
 
-        // Detect whether PDF has native selectable text (vs scanned image)
-        const pg1Content = await (await pdfDoc.getPage(1)).getTextContent();
+        const ab = await file.arrayBuffer();
+
+        // Detect native text
+        const jsDocCheck = await getDocument({ data: new Uint8Array(ab.slice()) }).promise;
+        const pg1 = await jsDocCheck.getPage(1);
+        const pg1Content = await pg1.getTextContent();
         const hasNativeText = pg1Content.items.some(it => it.str?.trim().length > 0);
 
         if (hasNativeText) {
-          // Canvas overlay — renders original page then replaces entity text in-place
-          const SCALE = 2;
-          const pg1   = await pdfDoc.getPage(1);
-          const { width: pgW, height: pgH } = pg1.getViewport({ scale: 1 });
-          const doc = new jsPDF({ unit: 'pt', format: [pgW, pgH], orientation: pgW > pgH ? 'landscape' : 'portrait' });
+          // ── NATIVE PDF: pdf-lib vector redaction ─────────────────
+          const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib');
 
-          for (let n = 1; n <= pdfDoc.numPages; n++) {
-            const page     = await pdfDoc.getPage(n);
-            const viewport = page.getViewport({ scale: SCALE });
+          const [libDoc, jsDoc] = await Promise.all([
+            PDFDocument.load(ab.slice()),
+            getDocument({ data: new Uint8Array(ab.slice()) }).promise,
+          ]);
+
+          const helvetica     = await libDoc.embedFont(StandardFonts.Helvetica);
+          const helveticaBold = await libDoc.embedFont(StandardFonts.HelveticaBold);
+          const libPages      = libDoc.getPages();
+
+          for (let n = 1; n <= jsDoc.numPages; n++) {
+            const jsPage  = await jsDoc.getPage(n);
+            const libPage = libPages[n - 1];
+            const { items } = await jsPage.getTextContent();
+
+            // Build character-level index for cross-item entity matching
+            let pageText = '';
+            const segs = [];
+            for (const item of items) {
+              if (!item.str) continue;
+              segs.push({ start: pageText.length, end: pageText.length + item.str.length, item });
+              pageText += item.str;
+            }
+
+            // Find which segments need redaction (keyed by segment index)
+            const pending = new Map(); // segIdx → replacedStr
+            for (const m of toApply) {
+              let from = 0;
+              while (true) {
+                const idx = pageText.indexOf(m.original, from);
+                if (idx === -1) break;
+                for (let si = 0; si < segs.length; si++) {
+                  const seg = segs[si];
+                  if (seg.end <= idx || seg.start >= idx + m.original.length) continue;
+                  const cur = pending.get(si) ?? seg.item.str;
+                  pending.set(si, cur.split(m.original).join(m.anonymized));
+                }
+                from = idx + m.original.length;
+              }
+            }
+
+            // Apply each redaction directly on the PDF
+            for (const [si, newStr] of pending) {
+              const item = segs[si].item;
+              const [a, b, , d, tx, ty] = item.transform;
+              const fontSize = Math.sqrt(a * a + b * b) || Math.abs(d) || 10;
+              const itemW    = item.width  || 50;
+              const itemH    = item.height > 0 ? item.height : fontSize * 1.2;
+
+              // Detect bold from font name
+              const isBold = /bold|black|heavy/i.test(item.fontName || '');
+              const font   = isBold ? helveticaBold : helvetica;
+
+              // Cover original text with white rectangle
+              libPage.drawRectangle({
+                x:      tx - 1,
+                y:      ty - itemH * 0.25,
+                width:  itemW + 2,
+                height: itemH * 1.35,
+                color:  rgb(1, 1, 1),
+                borderWidth: 0,
+              });
+
+              // Auto-shrink replacement text to fit original bounding box
+              let fSize = Math.max(4, Math.round(fontSize));
+              while (fSize > 4 && font.widthOfTextAtSize(newStr, fSize) > itemW) {
+                fSize -= 0.25;
+              }
+
+              libPage.drawText(newStr, {
+                x:    tx,
+                y:    ty,
+                size: fSize,
+                font,
+                color: rgb(0, 0, 0),
+              });
+            }
+          }
+
+          const bytes = await libDoc.save();
+          triggerDownload(
+            URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' })),
+            fname,
+          );
+
+        } else {
+          // ── SCANNED PDF: render original + redact via OCR bboxes ─
+          const { jsPDF } = await import('jspdf');
+          const jsDoc     = await getDocument({ data: new Uint8Array(ab.slice()) }).promise;
+          const OCR_SCALE = 2.5;
+
+          const pg1ref = await jsDoc.getPage(1);
+          const { width: pgW, height: pgH } = pg1ref.getViewport({ scale: 1 });
+          const pdfOut = new jsPDF({
+            unit: 'pt',
+            format: [pgW, pgH],
+            orientation: pgW > pgH ? 'landscape' : 'portrait',
+          });
+
+          for (let n = 1; n <= jsDoc.numPages; n++) {
+            const page     = await jsDoc.getPage(n);
+            const viewport = page.getViewport({ scale: OCR_SCALE });
             const canvas   = document.createElement('canvas');
             canvas.width   = viewport.width;
             canvas.height  = viewport.height;
-            const ctx = canvas.getContext('2d');
-            await page.render({ canvasContext: ctx, viewport }).promise;
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
 
-            for (const item of (await page.getTextContent()).items) {
-              if (!item.str?.trim()) continue;
-              let newStr = item.str;
-              for (const m of toApply) newStr = newStr.split(m.original).join(m.anonymized);
-              if (newStr === item.str) continue;
-              const [cx, cy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
-              const fsize  = (item.height || Math.abs(item.transform[3])) * SCALE;
-              const twidth = item.width * SCALE;
-              ctx.fillStyle = '#ffffff';
-              ctx.fillRect(cx - 1, cy - fsize * 0.92, twidth + 4, fsize * 1.18);
-              ctx.fillStyle = '#000000';
-              ctx.font = `${fsize}px Arial, Helvetica, sans-serif`;
-              ctx.textBaseline = 'alphabetic';
-              ctx.fillText(newStr, cx, cy);
+            // Redact using OCR word bboxes if available
+            if (wordData?.[n - 1]) {
+              const ctx   = canvas.getContext('2d');
+              const words = wordData[n - 1].words;
+              // Build word sequence for entity matching
+              const wordTexts = words.map(w => w.text);
+              const joined    = wordTexts.join(' ');
+
+              for (const m of toApply) {
+                // Try to match entity word-by-word in the OCR word sequence
+                const entityWords = m.original.trim().split(/\s+/);
+                for (let wi = 0; wi <= wordTexts.length - entityWords.length; wi++) {
+                  const match = entityWords.every((ew, off) =>
+                    wordTexts[wi + off]?.toLowerCase().includes(ew.toLowerCase()),
+                  );
+                  if (!match) continue;
+
+                  // Calculate union bounding box across all matched words
+                  let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+                  for (let off = 0; off < entityWords.length; off++) {
+                    const w = words[wi + off];
+                    bx0 = Math.min(bx0, w.x0); by0 = Math.min(by0, w.y0);
+                    bx1 = Math.max(bx1, w.x1); by1 = Math.max(by1, w.y1);
+                  }
+
+                  const bw = bx1 - bx0;
+                  const bh = by1 - by0;
+
+                  // White cover
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillRect(bx0 - 1, by0 - 1, bw + 2, bh + 2);
+
+                  // Replacement text — auto-size to fit
+                  let fs = bh * 0.75;
+                  ctx.font = `${fs}px Arial, sans-serif`;
+                  while (fs > 6 && ctx.measureText(m.anonymized).width > bw) {
+                    fs -= 0.5;
+                    ctx.font = `${fs}px Arial, sans-serif`;
+                  }
+                  ctx.fillStyle = '#1C1A18';
+                  ctx.textBaseline = 'alphabetic';
+                  ctx.fillText(m.anonymized, bx0, by1 - bh * 0.1);
+                }
+              }
             }
 
             const { width: pw, height: ph } = page.getViewport({ scale: 1 });
-            if (n > 1) doc.addPage([pw, ph]);
-            doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pw, ph);
+            if (n > 1) pdfOut.addPage([pw, ph]);
+            pdfOut.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, pw, ph);
           }
-          doc.save(fname);
-        } else {
-          // Scanned PDF — no selectable text layer, use professional template
-          await buildProfessionalPdf(rawText, docTitle, entityCount, fname);
+
+          pdfOut.save(fname);
         }
       } else {
         // Non-PDF source → professional template
@@ -821,6 +1129,21 @@ export default function Anonymizer() {
 
         {/* Actions */}
         <div className="flex items-center gap-2">
+          {/* Anonymization mode selector */}
+          {step !== 'idle' && mode === 'single' && step !== 'done' && (
+            <div className="flex items-center gap-1 bg-cream-100 border border-cream-200 rounded-lg p-0.5 text-xs mr-1">
+              {MODE_OPTIONS.map(m => (
+                <button
+                  key={m.id}
+                  onClick={() => setAnonymizationMode(m.id)}
+                  title={m.desc}
+                  className={`px-2.5 py-1.5 rounded-md font-medium transition-colors ${anonymizationMode === m.id ? 'bg-white text-ink shadow-sm' : 'text-ink-500 hover:text-ink'}`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          )}
           {/* Category pills */}
           {step !== 'idle' && mode === 'single' && (
             <div className="flex flex-wrap gap-1 mr-2">
@@ -892,6 +1215,13 @@ export default function Anonymizer() {
         <div className="mx-6 mt-3 px-4 py-2.5 bg-red-50 border border-red-200 rounded-lg text-red-700 text-xs shrink-0 flex items-center justify-between">
           {error}
           <button onClick={() => setError('')} className="ml-3 text-red-400 hover:text-red-600">✕</button>
+        </div>
+      )}
+
+      {/* OCR alerts banner */}
+      {alerts.length > 0 && step === 'ready' && (
+        <div className="mx-6 mt-2 space-y-1 shrink-0">
+          <AlertsPanel alerts={alerts} />
         </div>
       )}
 
@@ -1020,7 +1350,14 @@ export default function Anonymizer() {
                   <div className="w-8 h-8 rounded-lg bg-ink flex items-center justify-center text-white text-[10px] font-bold shrink-0">{fileExt}</div>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-ink truncate">{filename}</p>
-                    <p className="text-[11px] text-ink-400">{formatBytes(fileSize)} · {text.length.toLocaleString('fr-FR')} caractères</p>
+                    <p className="text-[11px] text-ink-400">
+                      {formatBytes(fileSize)} · {text.length.toLocaleString('fr-FR')} caractères
+                      {isOcrDoc && qualityScores && (
+                        <span className={`ml-2 font-medium ${qualityScores.ocr >= 80 ? 'text-emerald-600' : qualityScores.ocr >= 60 ? 'text-amber-600' : 'text-red-500'}`}>
+                          · OCR {qualityScores.ocr}%
+                        </span>
+                      )}
+                    </p>
                   </div>
                   <button onClick={reset} className="text-xs text-ink-400 hover:text-ink transition-colors">Changer</button>
                 </div>
@@ -1070,6 +1407,8 @@ export default function Anonymizer() {
                 </div>
                 <div className="flex-1 overflow-auto p-4 space-y-4">
                   <AnalysisPanel mapping={result.mapping} durationMs={result.durationMs} />
+                  <QualityPanel scores={qualityScores} isOcr={isOcrDoc} />
+                  <AlertsPanel alerts={alerts} />
 
                   {/* Validation mode */}
                   <div className="card p-4">

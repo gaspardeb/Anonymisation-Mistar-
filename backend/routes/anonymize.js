@@ -26,17 +26,37 @@ function audit(userId, action, details, ip) {
 }
 
 const CATEGORY_RULES = {
-  persons:       "- Noms et prénoms → remplacés par \"Monsieur A\", \"Madame B\", \"Dr. C\"... (lettres alphabétiques dans l'ordre d'apparition, respect du genre et du titre)",
-  numbers:       "- Numéros structurés (téléphone, sécurité sociale, IBAN, plaques d'immatriculation, numéros de factures, dossiers, dates de naissance) → [TEL_1], [SS_1], [IBAN_1], [PLAQUE_1], [FACT_1], [REF_1], [DATE_NAISS_1]",
-  addresses:     "- Adresses postales complètes → [ADRESSE_1], [ADRESSE_2]...",
-  gps:           "- Coordonnées GPS (latitude/longitude) → [GPS_1], [GPS_2]...",
-  emails:        "- Adresses email → [EMAIL_1], [EMAIL_2]...",
-  sensitive:     "- Données sensibles (santé, religion, syndicat, politique, orientation sexuelle) → [SENSIBLE_1 (catégorie)], [SENSIBLE_2 (catégorie)]...",
-  organizations: "- Noms d'organisations, marques, entreprises → [ORG_1], [ORG_2]...",
+  mask: {
+    persons:       "- Noms et prénoms → remplacés par \"Monsieur A\", \"Madame B\", \"Dr. C\"... (lettres alphabétiques dans l'ordre d'apparition, respect du genre et du titre)",
+    numbers:       "- Numéros structurés (téléphone, sécurité sociale, IBAN, plaques d'immatriculation, numéros de factures, dossiers, dates de naissance) → [TEL_1], [SS_1], [IBAN_1], [PLAQUE_1], [FACT_1], [REF_1], [DATE_NAISS_1]",
+    addresses:     "- Adresses postales complètes → [ADRESSE_1], [ADRESSE_2]...",
+    gps:           "- Coordonnées GPS (latitude/longitude) → [GPS_1], [GPS_2]...",
+    emails:        "- Adresses email → [EMAIL_1], [EMAIL_2]...",
+    sensitive:     "- Données sensibles (santé, religion, syndicat, politique, orientation sexuelle) → [SENSIBLE_1 (catégorie)], [SENSIBLE_2 (catégorie)]...",
+    organizations: "- Noms d'organisations, marques, entreprises → [ORG_1], [ORG_2]...",
+  },
+  tag: {
+    persons:       "- Noms et prénoms → [ANONYMISÉ]",
+    numbers:       "- Numéros structurés (téléphone, SS, IBAN, plaques, factures, dossiers, dates de naissance) → [ANONYMISÉ]",
+    addresses:     "- Adresses postales → [ANONYMISÉ]",
+    gps:           "- Coordonnées GPS → [ANONYMISÉ]",
+    emails:        "- Adresses email → [ANONYMISÉ]",
+    sensitive:     "- Données sensibles (santé, religion, syndicat, politique, orientation sexuelle) → [ANONYMISÉ]",
+    organizations: "- Noms d'organisations, marques, entreprises → [ANONYMISÉ]",
+  },
+  pseudo: {
+    persons:       "- Noms et prénoms → pseudonymes séquentiels PERSONNE_001, PERSONNE_002... (même personne = même pseudonyme partout)",
+    numbers:       "- Numéros structurés → TEL_001, SS_001, IBAN_001, PLAQUE_001, FACT_001, REF_001, DATE_001 (numérotés séquentiellement)",
+    addresses:     "- Adresses postales → ADRESSE_001, ADRESSE_002...",
+    gps:           "- Coordonnées GPS → GPS_001, GPS_002...",
+    emails:        "- Adresses email → EMAIL_001, EMAIL_002...",
+    sensitive:     "- Données sensibles → DONNEE_SENSIBLE_001, DONNEE_SENSIBLE_002...",
+    organizations: "- Noms d'organisations → ORGANISATION_001, ORGANISATION_002...",
+  },
 };
 
 router.post('/', requireAuth, anonymizationRateLimit, async (req, res) => {
-  const { text, filename, categories } = req.body;
+  const { text, filename, categories, mode = 'mask', qualityScores } = req.body;
 
   if (!text || !text.trim()) return res.status(400).json({ error: 'Texte vide' });
   if (!Array.isArray(categories) || categories.length === 0)
@@ -46,13 +66,16 @@ router.post('/', requireAuth, anonymizationRateLimit, async (req, res) => {
   if (!apiKey || apiKey === 'VOTRE_CLE_ICI')
     return res.status(500).json({ error: 'Clé API Mistral non configurée — renseignez MISTRAL_API_KEY dans backend/.env' });
 
+  const modeKey = ['mask', 'tag', 'pseudo'].includes(mode) ? mode : 'mask';
+  const rulesMap = CATEGORY_RULES[modeKey];
+
   const rules = categories
-    .filter(c => CATEGORY_RULES[c])
-    .map(c => CATEGORY_RULES[c])
+    .filter(c => rulesMap[c])
+    .map(c => rulesMap[c])
     .join('\n');
 
   const typeHints = categories
-    .filter(c => CATEGORY_RULES[c])
+    .filter(c => rulesMap[c])
     .map(c => `"${c}"`)
     .join(', ');
 
@@ -114,10 +137,10 @@ ${text}`;
     const safeFilename = (filename || 'sans_nom.txt').slice(0, 255);
 
     db.prepare(
-      'INSERT INTO history (user_id, filename, entity_count, categories, duration_ms, entity_types) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(req.user.id, safeFilename, entityCount, JSON.stringify(categories), durationMs, JSON.stringify(entityTypes));
+      'INSERT INTO history (user_id, filename, entity_count, categories, duration_ms, entity_types, anonymization_mode, quality_scores) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(req.user.id, safeFilename, entityCount, JSON.stringify(categories), durationMs, JSON.stringify(entityTypes), modeKey, qualityScores ? JSON.stringify(qualityScores) : null);
 
-    audit(req.user.id, 'ANONYMIZE', `Fichier: ${safeFilename}, Entités: ${entityCount}, Durée: ${durationMs}ms`, req.ip);
+    audit(req.user.id, 'ANONYMIZE', `Fichier: ${safeFilename}, Entités: ${entityCount}, Mode: ${modeKey}, Durée: ${durationMs}ms`, req.ip);
 
     res.json({ anonymized: parsed.anonymized, mapping, durationMs, entityTypes });
   } catch (err) {
