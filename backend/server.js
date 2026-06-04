@@ -21,6 +21,7 @@ app.use('/api/anonymize', require('./routes/anonymize'));
 app.use('/api/history',   require('./routes/history'));
 app.use('/api/admin',     require('./routes/admin'));
 app.use('/api/dashboard', require('./routes/dashboard'));
+app.use('/api/scan',      require('./routes/scanAnonymize'));
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }));
 

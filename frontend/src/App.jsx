@@ -8,6 +8,7 @@ import Admin from './pages/Admin';
 import Dashboard from './pages/Dashboard';
 import Audit from './pages/Audit';
 import Settings from './pages/Settings';
+import ScanAnonymizer from './pages/ScanAnonymizer';
 import Layout from './components/Layout';
 
 const AuthContext = createContext(null);
@@ -41,6 +42,7 @@ export default function App() {
             <Route index element={<Navigate to="/anonymizer" replace />} />
             <Route path="dashboard"  element={<Dashboard />} />
             <Route path="anonymizer" element={<Anonymizer />} />
+            <Route path="scan-anonymizer" element={<ScanAnonymizer />} />
             <Route path="history"    element={<History />} />
             <Route path="settings"   element={<Settings />} />
             <Route path="audit"      element={user?.role === 'admin' ? <Audit />  : <Navigate to="/anonymizer" replace />} />
