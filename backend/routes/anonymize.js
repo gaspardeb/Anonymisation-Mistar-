@@ -25,29 +25,92 @@ function audit(userId, action, details, ip) {
   ).run(userId, action, details, ip);
 }
 
+// Pré-détection regex des patterns structurés français (certitude élevée)
+function preDetectSensitiveData(text, categories) {
+  const found = new Set();
+
+  if (categories.includes('numbers')) {
+    // Téléphones français (fixes et mobiles)
+    const phones = [
+      /(?:(?:\+|00)33[\s.\-]?(?:\(0\)[\s.\-]?)?|0)[1-9](?:[\s.\-]?\d{2}){4}/g,
+    ];
+    // Numéros de sécurité sociale
+    const ssn = /[12][\s]?\d{2}[\s]?(?:0[1-9]|1[0-2]|[2-9]\d)[\s]?\d{2,3}[\s]?\d{3}[\s]?\d{3}[\s]?\d{2}/g;
+    // IBAN (FR et autres)
+    const iban = /\b[A-Z]{2}\d{2}(?:[\s]?[A-Z0-9]{4}){4,7}[\s]?[A-Z0-9]{0,4}\b/g;
+    // Plaques d'immatriculation (nouveau format AA-123-AA)
+    const plates = /\b[A-Z]{2}[\s\-]\d{3}[\s\-][A-Z]{2}\b/g;
+
+    for (const re of [...phones, ssn, iban, plates]) {
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        const v = m[0].trim();
+        if (v.length >= 6) found.add(v);
+      }
+    }
+  }
+
+  if (categories.includes('emails')) {
+    const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+    let m;
+    while ((m = emailRe.exec(text)) !== null) found.add(m[0].trim());
+  }
+
+  if (categories.includes('addresses')) {
+    // Code postal + ville
+    const postalCity = /\b(?:0[1-9]|[1-8]\d|9[0-5])\d{3}\b[\s,\-]+[A-ZÀ-Ÿa-zà-ÿ][A-ZÀ-Ÿa-zà-ÿ\s\-']{1,35}/g;
+    // Numéro + type de voie + nom de voie
+    const street = /\b\d{1,4}(?:\s*(?:bis|ter|quater|b|t))?[,\s]+(?:rue|avenue|av\.?|boulevard|bd\.?|chemin|allée|impasse|place|route|voie|passage|cour|résidence|villa|cité|square|quai|esplanade|hameau|lieu[\s\-]dit|lotissement)\b[^\n,]{4,60}/gi;
+
+    for (const re of [postalCity, street]) {
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        const v = m[0].trim();
+        if (v.length >= 6) found.add(v);
+      }
+    }
+  }
+
+  if (categories.includes('gps')) {
+    // Coordonnées GPS décimales
+    const gps = /[-+]?\d{1,2}\.\d{4,},?\s*[-+]?\d{1,3}\.\d{4,}/g;
+    // Coordonnées DMS
+    const dms = /\d{1,3}°\s*\d{1,2}['′]\s*(?:\d{1,2}(?:[.,]\d+)?["″]\s*)?[NSEWnsew]/g;
+    for (const re of [gps, dms]) {
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) found.add(m[0].trim());
+    }
+  }
+
+  return [...found];
+}
+
 const CATEGORY_RULES = {
   mask: {
-    persons:       "- Noms et prénoms → remplacés par \"Monsieur A\", \"Madame B\", \"Dr. C\"... (lettres alphabétiques dans l'ordre d'apparition, respect du genre et du titre)",
-    numbers:       "- Numéros structurés (téléphone, sécurité sociale, IBAN, plaques d'immatriculation, numéros de factures, dossiers, dates de naissance) → [TEL_1], [SS_1], [IBAN_1], [PLAQUE_1], [FACT_1], [REF_1], [DATE_NAISS_1]",
-    addresses:     "- Adresses postales complètes → [ADRESSE_1], [ADRESSE_2]...",
-    gps:           "- Coordonnées GPS (latitude/longitude) → [GPS_1], [GPS_2]...",
+    persons:       "- Noms et prénoms (y compris initiales isolées si accompagnées d'un titre) → remplacés par \"Monsieur A\", \"Madame B\", \"Dr. C\"... (lettres alphabétiques dans l'ordre d'apparition, respect du genre et du titre)",
+    numbers:       "- Numéros structurés : téléphone (0X XX XX XX XX, +33...), sécurité sociale (13 chiffres), IBAN, plaques d'immatriculation (AA-123-AA), numéros de factures, de dossiers, de contrats, dates de naissance → [TEL_1], [SS_1], [IBAN_1], [PLAQUE_1], [FACT_1], [REF_1], [DATE_NAISS_1]",
+    addresses:     "- Adresses postales sous toutes leurs formes : adresse complète, fragment (code postal seul + ville, rue seule, numéro + rue, cedex, BP) → [ADRESSE_1], [ADRESSE_2]... Chaque fragment distinct = un token distinct",
+    gps:           "- Coordonnées GPS (latitude/longitude décimales ou DMS) → [GPS_1], [GPS_2]...",
     emails:        "- Adresses email → [EMAIL_1], [EMAIL_2]...",
-    sensitive:     "- Données sensibles (santé, religion, syndicat, politique, orientation sexuelle) → [SENSIBLE_1 (catégorie)], [SENSIBLE_2 (catégorie)]...",
-    organizations: "- Noms d'organisations, marques, entreprises → [ORG_1], [ORG_2]...",
+    sensitive:     "- Données sensibles (santé, pathologie, traitement médical, religion, appartenance syndicale, opinion politique, orientation sexuelle) → [SENSIBLE_1 (catégorie)], [SENSIBLE_2 (catégorie)]...",
+    organizations: "- Noms d'organisations, sociétés, marques, administrations, établissements scolaires, hôpitaux → [ORG_1], [ORG_2]...",
   },
   tag: {
-    persons:       "- Noms et prénoms → [ANONYMISÉ]",
+    persons:       "- Noms et prénoms (y compris initiales isolées si accompagnées d'un titre) → [ANONYMISÉ]",
     numbers:       "- Numéros structurés (téléphone, SS, IBAN, plaques, factures, dossiers, dates de naissance) → [ANONYMISÉ]",
-    addresses:     "- Adresses postales → [ANONYMISÉ]",
+    addresses:     "- Adresses postales sous toutes leurs formes (complètes ou fragments : code postal + ville, rue seule, BP, cedex) → [ANONYMISÉ]",
     gps:           "- Coordonnées GPS → [ANONYMISÉ]",
     emails:        "- Adresses email → [ANONYMISÉ]",
     sensitive:     "- Données sensibles (santé, religion, syndicat, politique, orientation sexuelle) → [ANONYMISÉ]",
-    organizations: "- Noms d'organisations, marques, entreprises → [ANONYMISÉ]",
+    organizations: "- Noms d'organisations, marques, entreprises, établissements → [ANONYMISÉ]",
   },
   pseudo: {
-    persons:       "- Noms et prénoms → pseudonymes séquentiels PERSONNE_001, PERSONNE_002... (même personne = même pseudonyme partout)",
+    persons:       "- Noms et prénoms (y compris initiales isolées si accompagnées d'un titre) → pseudonymes séquentiels PERSONNE_001, PERSONNE_002... (même personne = même pseudonyme partout)",
     numbers:       "- Numéros structurés → TEL_001, SS_001, IBAN_001, PLAQUE_001, FACT_001, REF_001, DATE_001 (numérotés séquentiellement)",
-    addresses:     "- Adresses postales → ADRESSE_001, ADRESSE_002...",
+    addresses:     "- Adresses postales sous toutes leurs formes (complètes ou fragments) → ADRESSE_001, ADRESSE_002...",
     gps:           "- Coordonnées GPS → GPS_001, GPS_002...",
     emails:        "- Adresses email → EMAIL_001, EMAIL_002...",
     sensitive:     "- Données sensibles → DONNEE_SENSIBLE_001, DONNEE_SENSIBLE_002...",
@@ -56,7 +119,7 @@ const CATEGORY_RULES = {
 };
 
 router.post('/', requireAuth, anonymizationRateLimit, async (req, res) => {
-  const { text, filename, categories, mode = 'mask', qualityScores } = req.body;
+  const { text, filename, categories, mode = 'mask', qualityScores, forcedEntities = [] } = req.body;
 
   if (!text || !text.trim()) return res.status(400).json({ error: 'Texte vide' });
   if (!Array.isArray(categories) || categories.length === 0)
@@ -79,12 +142,24 @@ router.post('/', requireAuth, anonymizationRateLimit, async (req, res) => {
     .map(c => `"${c}"`)
     .join(', ');
 
+  const preDetected = preDetectSensitiveData(text, categories);
+  const safeForced = Array.isArray(forcedEntities)
+    ? forcedEntities.filter(e => typeof e === 'string' && e.trim()).map(e => e.trim())
+    : [];
+  const allMandatory = [...preDetected, ...safeForced];
+  const mandatorySection = allMandatory.length > 0
+    ? `\nENTITÉS DÉTECTÉES AVEC CERTITUDE — tu DOIS toutes les anonymiser sans exception :\n${allMandatory.map(e => `• "${e}"`).join('\n')}\n`
+    : '';
+
   const prompt = `Tu es un expert en anonymisation RGPD. Anonymise le texte suivant en remplaçant toutes les données identifiantes selon ces règles :
 ${rules}
+${mandatorySection}
 RÈGLES IMPORTANTES :
+- Parcours le texte ligne par ligne, mot par mot — ne saute aucune donnée même si elle semble anodine
 - Cohérence des substituts : même entité = même code partout dans le texte
 - Numérotation séquentielle pour chaque type
-- Conserver la structure et la mise en forme du texte
+- Anonymise les adresses même fragmentées : un code postal seul + une ville = une adresse à anonymiser
+- Conserver exactement la structure, la mise en forme et les sauts de ligne du texte
 - Dans le mapping, le champ "type" doit être EXACTEMENT l'une de ces valeurs : ${typeHints}
 Réponds UNIQUEMENT avec un JSON valide, sans markdown, sans backticks :
 {"anonymized":"...","mapping":[{"original":"...","anonymized":"...","type":"..."}]}
@@ -122,7 +197,7 @@ ${text}`;
     const content = data.choices?.[0]?.message?.content;
     const parsed  = parseJsonSafely(content);
 
-    if (!parsed)         return res.status(502).json({ error: 'Réponse Mistral non parseable — réessayez' });
+    if (!parsed)            return res.status(502).json({ error: 'Réponse Mistral non parseable — réessayez' });
     if (!parsed.anonymized) return res.status(502).json({ error: 'Réponse Mistral incomplète (champ anonymized manquant)' });
 
     const durationMs  = Date.now() - startTime;

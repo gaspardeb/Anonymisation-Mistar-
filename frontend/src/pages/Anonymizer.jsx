@@ -34,7 +34,7 @@ function ProgressBar({ progress }) {
   );
 }
 
-function HighlightedText({ text, mapping, excluded = new Set() }) {
+function HighlightedText({ text, mapping, excluded = new Set(), searchQuery = '' }) {
   const highlights = useMemo(() => {
     const filtered = excluded.size
       ? mapping.filter(m => !excluded.has(m.original))
@@ -54,10 +54,30 @@ function HighlightedText({ text, mapping, excluded = new Set() }) {
     return result;
   }, [text, highlights]);
 
+  const safeSearch = searchQuery.trim();
+  const searchRegex = useMemo(
+    () => safeSearch ? new RegExp(`(${safeSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi') : null,
+    [safeSearch]
+  );
+
   return (
     <pre className="whitespace-pre-wrap text-sm font-sans leading-relaxed text-ink-700">
       {parts.map((p, i) => {
-        if (!p.h) return <span key={i}>{p.text}</span>;
+        if (!p.h) {
+          if (searchRegex) {
+            const subParts = p.text.split(searchRegex);
+            return (
+              <React.Fragment key={i}>
+                {subParts.map((sp, si) =>
+                  si % 2 === 1
+                    ? <mark key={si} className="bg-yellow-200 text-ink rounded px-0.5 not-italic">{sp}</mark>
+                    : <span key={si}>{sp}</span>
+                )}
+              </React.Fragment>
+            );
+          }
+          return <span key={i}>{p.text}</span>;
+        }
         const c = ENTITY_COLORS[p.h.type];
         return (
           <mark
@@ -108,15 +128,8 @@ function AnalysisPanel({ mapping, durationMs }) {
 
   return (
     <div className="card p-5">
-      <div className="flex items-center justify-between mb-4">
+      <div className="mb-4">
         <h3 className="text-sm font-semibold text-ink">Analyse du document</h3>
-        <div className="flex items-center gap-3 text-[11px] text-ink-400">
-          {durationMs && <span>{(durationMs / 1000).toFixed(1)}s</span>}
-          <span className="flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
-            Confiance ~97%
-          </span>
-        </div>
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         {Object.entries(stats).map(([type, count]) => {
@@ -480,6 +493,11 @@ export default function Anonymizer() {
   const multiDropRef                  = useRef(null);
   const [multiDragging, setMultiDragging] = useState(false);
 
+  // Search & manual anonymization
+  const [searchQuery, setSearchQuery] = useState('');
+  const [pendingWords, setPendingWords] = useState([]);
+  const [reanalyzing, setReanalyzing] = useState(false);
+
   // Close export dropdown on outside click
   useEffect(() => {
     const handler = e => {
@@ -564,14 +582,64 @@ export default function Anonymizer() {
 
   function getFinalAnonymized() {
     if (!result) return '';
-    if (!manualMode || excluded.size === 0) return result.anonymized;
     let out = result.anonymized;
+    if (!manualMode || excluded.size === 0) return out;
     for (const item of result.mapping) {
       if (excluded.has(item.original) && item.anonymized) {
         out = out.replaceAll(item.anonymized, item.original);
       }
     }
     return out;
+  }
+
+  function addPendingWord(word) {
+    const cleaned = word.trim();
+    if (!cleaned) return;
+    if (pendingWords.includes(cleaned)) return;
+    setPendingWords(prev => [...prev, cleaned]);
+    setSearchQuery('');
+  }
+
+  async function reanalyzeWithPending() {
+    if (!text.trim() || pendingWords.length === 0) return;
+    setReanalyzing(true);
+    try {
+      const data = await api.post('/anonymize', {
+        text, filename, categories,
+        mode: anonymizationMode,
+        qualityScores,
+        forcedEntities: pendingWords,
+      });
+
+      // Guarantee every forced word is anonymized even if the AI missed it
+      let anonymized = data.anonymized;
+      const mapping = [...data.mapping];
+      let counter = mapping.length + 1;
+
+      for (const word of pendingWords) {
+        if (mapping.some(m => m.original === word)) continue;
+        if (!anonymized.includes(word)) continue;
+        let token;
+        if (anonymizationMode === 'tag') {
+          token = '[ANONYMISÉ]';
+        } else if (anonymizationMode === 'pseudo') {
+          token = `DONNÉE_${String(counter).padStart(3, '0')}`;
+        } else {
+          token = `[DONNÉE_${counter}]`;
+        }
+        counter++;
+        anonymized = anonymized.replaceAll(word, token);
+        mapping.push({ original: word, anonymized: token, type: 'manual' });
+      }
+
+      setResult({ ...data, anonymized, mapping });
+      setPendingWords([]);
+      setSearchQuery('');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setReanalyzing(false);
+    }
   }
 
   function reset() {
@@ -588,6 +656,8 @@ export default function Anonymizer() {
     setAlerts([]);
     setIsOcrDoc(false);
     setOcrWordData(null);
+    setSearchQuery('');
+    setPendingWords([]);
   }
 
   // ── Export ────────────────────────────────────────────────
@@ -1098,6 +1168,12 @@ export default function Anonymizer() {
 
   const finalAnonymized = step === 'done' ? getFinalAnonymized() : '';
 
+  function handleTextSelection() {
+    const sel = window.getSelection();
+    const word = sel?.toString().trim();
+    if (word) setSearchQuery(word);
+  }
+
   // ── RENDER ────────────────────────────────────────────────
 
   return (
@@ -1105,72 +1181,19 @@ export default function Anonymizer() {
 
       {/* Top bar */}
       <div className="bg-white border-b border-cream-300 px-6 py-3 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
-          <div>
+        <div>
+          {filename ? (
+            <p className="text-sm font-semibold text-ink truncate max-w-sm">{filename}</p>
+          ) : (
             <h1 className="text-sm font-semibold text-ink">Anonymisation</h1>
-            <p className="text-[11px] text-ink-400 mt-0.5">PDF · DOCX · TXT · CSV · et tous formats</p>
-          </div>
-          {/* Mode switch */}
-          <div className="flex items-center gap-1 bg-cream-100 border border-cream-200 rounded-lg p-0.5 text-xs">
-            <button
-              onClick={() => { setMode('single'); reset(); }}
-              className={`px-3 py-1.5 rounded-md font-medium transition-colors ${mode === 'single' ? 'bg-white text-ink shadow-sm' : 'text-ink-500 hover:text-ink'}`}
-            >
-              Document unique
-            </button>
-            <button
-              onClick={() => setMode('multi')}
-              className={`px-3 py-1.5 rounded-md font-medium transition-colors ${mode === 'multi' ? 'bg-white text-ink shadow-sm' : 'text-ink-500 hover:text-ink'}`}
-            >
-              Multi-documents
-            </button>
-          </div>
+          )}
         </div>
 
-        {/* Actions */}
         <div className="flex items-center gap-2">
-          {/* Anonymization mode selector */}
-          {step !== 'idle' && mode === 'single' && step !== 'done' && (
-            <div className="flex items-center gap-1 bg-cream-100 border border-cream-200 rounded-lg p-0.5 text-xs mr-1">
-              {MODE_OPTIONS.map(m => (
-                <button
-                  key={m.id}
-                  onClick={() => setAnonymizationMode(m.id)}
-                  title={m.desc}
-                  className={`px-2.5 py-1.5 rounded-md font-medium transition-colors ${anonymizationMode === m.id ? 'bg-white text-ink shadow-sm' : 'text-ink-500 hover:text-ink'}`}
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-          )}
-          {/* Category pills */}
-          {step !== 'idle' && mode === 'single' && (
-            <div className="flex flex-wrap gap-1 mr-2">
-              {CATEGORIES.map(cat => (
-                <button
-                  key={cat.id}
-                  onClick={() => toggleCategory(cat.id)}
-                  className={`px-2.5 py-1 text-[11px] font-medium rounded-full border transition-colors ${
-                    categories.includes(cat.id)
-                      ? 'bg-ink text-white border-ink'
-                      : 'bg-white text-ink-400 border-ink-100 hover:border-ink-300'
-                  }`}
-                >
-                  {cat.label}
-                </button>
-              ))}
-            </div>
-          )}
-
           {step === 'done' && (
             <>
-              <button
-                onClick={reset}
-                className="btn-ghost text-xs px-3 py-1.5"
-              >
-                Nouveau
-              </button>
+              <button onClick={reset} className="btn-ghost text-xs px-3 py-1.5">Nouveau</button>
+              <button onClick={() => setStep('analyzed')} className="btn-ghost text-xs px-3 py-1.5">Revenir</button>
               <div className="relative" ref={exportRef}>
                 <button onClick={() => setShowExport(v => !v)} className="btn-primary flex items-center gap-1.5 text-xs px-3 py-1.5">
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
@@ -1197,7 +1220,7 @@ export default function Anonymizer() {
           )}
 
           {step === 'analyzed' && (
-            <button onClick={handleConfirm} className="btn-primary text-sm px-4 py-1.5">
+            <button onClick={handleConfirm} className="btn-primary text-sm px-6 py-2.5 font-semibold">
               Anonymiser →
             </button>
           )}
@@ -1341,32 +1364,27 @@ export default function Anonymizer() {
             </div>
           )}
 
-          {/* STEP: READY — file loaded, show preview */}
+          {/* STEP: READY — file loaded, show filename only */}
           {step === 'ready' && (
-            <div className="flex-1 flex overflow-hidden">
-              <div className="flex-1 flex flex-col overflow-hidden">
-                {/* File info bar */}
-                <div className="bg-cream-50 border-b border-cream-200 px-5 py-3 flex items-center gap-3 shrink-0">
-                  <div className="w-8 h-8 rounded-lg bg-ink flex items-center justify-center text-white text-[10px] font-bold shrink-0">{fileExt}</div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-ink truncate">{filename}</p>
-                    <p className="text-[11px] text-ink-400">
-                      {formatBytes(fileSize)} · {text.length.toLocaleString('fr-FR')} caractères
-                      {isOcrDoc && qualityScores && (
-                        <span className={`ml-2 font-medium ${qualityScores.ocr >= 80 ? 'text-emerald-600' : qualityScores.ocr >= 60 ? 'text-amber-600' : 'text-red-500'}`}>
-                          · OCR {qualityScores.ocr}%
-                        </span>
-                      )}
-                    </p>
+            <div className="flex-1 flex items-center justify-center p-8">
+              <div className="w-full max-w-sm text-center">
+                <div className="border-2 border-cream-200 rounded-2xl p-10 bg-white">
+                  <div className="w-12 h-12 rounded-xl bg-ink flex items-center justify-center text-white text-[11px] font-bold mx-auto mb-4">
+                    {fileExt}
                   </div>
-                  <button onClick={reset} className="text-xs text-ink-400 hover:text-ink transition-colors">Changer</button>
+                  <p className="text-sm font-semibold text-ink mb-1 truncate px-2">{filename}</p>
+                  <p className="text-xs text-ink-400">
+                    {formatBytes(fileSize)}
+                    {isOcrDoc && qualityScores && (
+                      <span className={`ml-2 font-medium ${qualityScores.ocr >= 80 ? 'text-emerald-600' : qualityScores.ocr >= 60 ? 'text-amber-600' : 'text-red-500'}`}>
+                        · OCR {qualityScores.ocr}%
+                      </span>
+                    )}
+                  </p>
+                  <button onClick={reset} className="text-xs text-ink-400 hover:text-ink transition-colors mt-4">
+                    Changer de fichier
+                  </button>
                 </div>
-                <textarea
-                  value={text}
-                  onChange={e => setText(e.target.value)}
-                  className="flex-1 p-5 resize-none outline-none text-sm text-ink-700 leading-relaxed bg-white font-sans placeholder-ink-300"
-                  placeholder="Vous pouvez modifier le texte avant l'analyse…"
-                />
               </div>
             </div>
           )}
@@ -1395,17 +1413,74 @@ export default function Anonymizer() {
                   <span className="text-[10px] font-semibold text-ink-500 uppercase tracking-widest">Document original</span>
                   {detectedTypes.length > 0 && <ColorLegend types={detectedTypes} />}
                 </div>
-                <div className="flex-1 overflow-auto p-5">
-                  <HighlightedText text={text} mapping={result.mapping} excluded={excluded} />
+                <div className="flex-1 overflow-auto p-5" onMouseUp={handleTextSelection}>
+                  <HighlightedText text={text} mapping={result.mapping} excluded={excluded} searchQuery={searchQuery} />
                 </div>
               </div>
 
               {/* Right: analysis panel */}
-              <div className="w-80 flex flex-col overflow-hidden bg-cream-50 shrink-0">
+              <div className="w-[420px] flex flex-col overflow-hidden bg-cream-50 shrink-0">
                 <div className="px-4 py-2.5 border-b border-cream-200 flex items-center justify-between shrink-0">
                   <span className="text-[10px] font-semibold text-ink-500 uppercase tracking-widest">Résultat d'analyse</span>
                 </div>
                 <div className="flex-1 overflow-auto p-4 space-y-4">
+                  {/* Search & manual anonymization */}
+                  <div className="card p-4 space-y-2.5">
+                    <h3 className="text-xs font-semibold text-ink">Anonymisation manuelle</h3>
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                        </svg>
+                        <input
+                          type="text"
+                          value={searchQuery}
+                          onChange={e => setSearchQuery(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && addPendingWord(searchQuery)}
+                          placeholder="Rechercher ou sélectionner…"
+                          className="w-full text-xs border border-cream-200 rounded-lg pl-8 pr-3 py-2 bg-white outline-none focus:border-ink-300 text-ink"
+                        />
+                      </div>
+                      <button
+                        onClick={() => addPendingWord(searchQuery)}
+                        disabled={!searchQuery.trim()}
+                        className="text-xs px-3 py-2 shrink-0 rounded-lg border border-cream-200 bg-white text-ink-600 hover:bg-cream-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Ajouter
+                      </button>
+                    </div>
+                    <div className="min-h-[28px] flex flex-wrap gap-1.5 items-start pt-0.5">
+                      {pendingWords.length === 0
+                        ? <p className="text-[10px] text-ink-300 italic">Aucun mot en attente — ajoutez-en plusieurs puis relancez</p>
+                        : pendingWords.map(word => (
+                            <span key={word} className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                              {word}
+                              <button
+                                onClick={() => setPendingWords(prev => prev.filter(w => w !== word))}
+                                className="hover:text-amber-900 ml-0.5"
+                              >
+                                <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                              </button>
+                            </span>
+                          ))
+                      }
+                    </div>
+                    {pendingWords.length > 0 && (
+                      <button
+                        onClick={reanalyzeWithPending}
+                        disabled={reanalyzing}
+                        className="w-full btn-primary text-xs py-2 flex items-center justify-center gap-2 disabled:opacity-70"
+                      >
+                        {reanalyzing
+                          ? <><Spinner className="w-3 h-3" /> Analyse en cours…</>
+                          : <>Relancer l'analyse IA ({pendingWords.length} mot{pendingWords.length > 1 ? 's' : ''})</>
+                        }
+                      </button>
+                    )}
+                    <p className="text-[10px] text-ink-400 leading-relaxed">
+                      Sélectionnez un mot dans le texte à gauche · Entrée ou "Ajouter" pour le mettre en file
+                    </p>
+                  </div>
                   <AnalysisPanel mapping={result.mapping} durationMs={result.durationMs} />
                   <QualityPanel scores={qualityScores} isOcr={isOcrDoc} />
                   <AlertsPanel alerts={alerts} />
