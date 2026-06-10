@@ -3,42 +3,9 @@ import { api } from '../api/client';
 
 const TABS = [
   { id: 'users',   label: 'Utilisateurs'   },
-  { id: 'models',  label: 'Modèles métier' },
   { id: 'config',  label: 'Configuration'  },
 ];
 
-const BUSINESS_MODELS = [
-  {
-    id: 'rh', label: 'Ressources Humaines',
-    categories: ['persons', 'emails', 'numbers', 'addresses'],
-    description: 'Contrats, fiches de paie, dossiers RH',
-  },
-  {
-    id: 'juridique', label: 'Juridique',
-    categories: ['persons', 'organizations', 'addresses', 'numbers'],
-    description: 'Actes, contrats, jugements',
-  },
-  {
-    id: 'sante', label: 'Santé',
-    categories: ['persons', 'sensitive', 'numbers', 'addresses'],
-    description: 'Dossiers patients, ordonnances, rapports médicaux',
-  },
-  {
-    id: 'finance', label: 'Finance',
-    categories: ['persons', 'numbers', 'organizations', 'emails'],
-    description: 'Relevés, factures, virements',
-  },
-];
-
-const ALL_CATEGORIES = [
-  { id: 'persons',       label: 'Noms / prénoms'    },
-  { id: 'emails',        label: 'Emails'            },
-  { id: 'numbers',       label: 'Numéros structurés'},
-  { id: 'addresses',     label: 'Adresses postales' },
-  { id: 'gps',           label: 'Coordonnées GPS'   },
-  { id: 'sensitive',     label: 'Données sensibles' },
-  { id: 'organizations', label: 'Organisations'     },
-];
 
 function Modal({ title, onClose, children }) {
   return (
@@ -116,8 +83,6 @@ export default function Admin() {
   const [resetModal, setResetModal] = useState(null);
   const [showNewUser, setShowNewUser] = useState(false);
   const [toast, setToast]           = useState('');
-  const [selectedModel, setSelectedModel] = useState(null);
-
   function showToast(msg) { setToast(msg); setTimeout(() => setToast(''), 3000); }
 
   useEffect(() => { loadUsers(); loadConfig(); }, []);
@@ -210,55 +175,6 @@ export default function Admin() {
               </tbody>
             </table>
           </div>
-        </div>
-      )}
-
-      {/* ── MODELS ── */}
-      {tab === 'models' && (
-        <div>
-          <p className="text-sm text-ink-500 mb-5">Profils prédéfinis de catégories par secteur métier. Sélectionnez un modèle pour voir les catégories incluses.</p>
-          <div className="grid grid-cols-2 gap-4">
-            {BUSINESS_MODELS.map(model => (
-              <div
-                key={model.id}
-                onClick={() => setSelectedModel(selectedModel?.id === model.id ? null : model)}
-                className={`card p-5 cursor-pointer transition-all duration-150 ${
-                  selectedModel?.id === model.id ? 'ring-2 ring-ink' : 'hover:shadow-sm'
-                }`}
-              >
-                <div className="flex items-start justify-between mb-3">
-                  <div>
-                    <p className="text-sm font-semibold text-ink">{model.label}</p>
-                    <p className="text-xs text-ink-400 mt-0.5">{model.description}</p>
-                  </div>
-                  {selectedModel?.id === model.id && (
-                    <svg className="w-4 h-4 text-ink shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {model.categories.map(cat => {
-                    const c = ALL_CATEGORIES.find(a => a.id === cat);
-                    return (
-                      <span key={cat} className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-ink text-white">
-                        {c?.label || cat}
-                      </span>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-          {selectedModel && (
-            <div className="mt-4 p-4 bg-cream-50 border border-cream-200 rounded-xl">
-              <p className="text-xs text-ink-500 mb-2">
-                Modèle <strong className="text-ink">{selectedModel.label}</strong> sélectionné.
-                Ces catégories seront pré-cochées lors de la prochaine anonymisation.
-              </p>
-              <p className="text-[11px] text-ink-400">
-                Catégories : {selectedModel.categories.map(c => ALL_CATEGORIES.find(a => a.id === c)?.label || c).join(', ')}
-              </p>
-            </div>
-          )}
         </div>
       )}
 

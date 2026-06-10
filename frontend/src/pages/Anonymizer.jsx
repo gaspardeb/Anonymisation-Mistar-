@@ -467,7 +467,13 @@ export default function Anonymizer() {
   const [anonymizationMode, setAnonymizationMode] = useState('mask'); // mask | tag | pseudo
 
   // Categories
-  const [categories, setCategories] = useState(['persons', 'numbers', 'addresses', 'emails']);
+  const [categories, setCategories] = useState(() => {
+    try {
+      const saved = localStorage.getItem('anon_categories');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return CATEGORIES.map(c => c.id);
+  });
 
   // Result
   const [result, setResult]     = useState(null);
@@ -551,7 +557,11 @@ export default function Anonymizer() {
   }
 
   function toggleCategory(id) {
-    setCategories(prev => prev.includes(id) ? prev.filter(c => c !== id) : [...prev, id]);
+    setCategories(prev => {
+      const next = prev.includes(id) ? prev.filter(c => c !== id) : [...prev, id];
+      localStorage.setItem('anon_categories', JSON.stringify(next));
+      return next;
+    });
   }
 
   async function handleAnalyze() {
@@ -1180,39 +1190,37 @@ export default function Anonymizer() {
     <div className="h-full flex flex-col overflow-hidden">
 
       {/* Top bar */}
-      <div className="bg-white border-b border-cream-300 px-6 py-3 flex items-center justify-between shrink-0">
+      <div className="bg-white border-b border-cream-300 px-6 h-[85px] flex items-center justify-between shrink-0">
         <div>
           {filename ? (
-            <p className="text-sm font-semibold text-ink truncate max-w-sm">{filename}</p>
+            <p className="text-base font-semibold text-ink truncate max-w-lg">{filename}</p>
           ) : (
-            <h1 className="text-sm font-semibold text-ink">Anonymisation</h1>
+            <h1 className="text-base font-semibold text-ink">Anonymisation</h1>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           {step === 'done' && (
             <>
-              <button onClick={reset} className="btn-ghost text-xs px-3 py-1.5">Nouveau</button>
-              <button onClick={() => setStep('analyzed')} className="btn-ghost text-xs px-3 py-1.5">Revenir</button>
+              <button onClick={reset} className="btn-ghost text-sm px-4 py-2">Nouveau</button>
+              <button onClick={() => setStep('analyzed')} className="btn-ghost text-sm px-4 py-2">Revenir</button>
               <div className="relative" ref={exportRef}>
-                <button onClick={() => setShowExport(v => !v)} className="btn-primary flex items-center gap-1.5 text-xs px-3 py-1.5">
-                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                <button onClick={() => setShowExport(v => !v)} className="btn-primary flex items-center gap-2 text-sm px-5 py-2.5 font-semibold">
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
                   Exporter
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
                 </button>
                 {showExport && (
-                  <div className="absolute right-0 top-full mt-1.5 bg-white border border-cream-300 rounded-xl shadow-lg z-20 overflow-hidden min-w-[11rem]">
-                    <button onClick={() => { exportPdf();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors flex items-center justify-between gap-3">
-                      <span>PDF</span>
-                      {/\.pdf$/i.test(filename) && <span className="text-[10px] text-emerald-600 font-medium">mise en page originale</span>}
+                  <div className="absolute right-0 top-full mt-1.5 bg-white border border-cream-300 rounded-xl shadow-lg z-20 overflow-hidden min-w-[10rem]">
+                    <button onClick={() => { exportPdf();  setShowExport(false); }} className="w-full text-left px-4 py-3 text-sm text-ink-700 hover:bg-cream-100 transition-colors">
+                      PDF
                     </button>
-                    <button onClick={() => { exportDocx(); setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200 flex items-center justify-between gap-3">
-                      <span>DOCX</span>
-                      <span className="text-[10px] text-ink-400 font-medium">gabarit professionnel</span>
+                    <button onClick={() => { exportDocx(); setShowExport(false); }} className="w-full text-left px-4 py-3 text-sm text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">
+                      DOCX
                     </button>
-                    <button onClick={() => { exportTxt();  setShowExport(false); }} className="w-full text-left px-4 py-2.5 text-xs text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">TXT</button>
+                    <button onClick={() => { exportTxt();  setShowExport(false); }} className="w-full text-left px-4 py-3 text-sm text-ink-700 hover:bg-cream-100 transition-colors border-t border-cream-200">TXT</button>
                   </div>
                 )}
               </div>
@@ -1220,13 +1228,13 @@ export default function Anonymizer() {
           )}
 
           {step === 'analyzed' && (
-            <button onClick={handleConfirm} className="btn-primary text-sm px-6 py-2.5 font-semibold">
+            <button onClick={handleConfirm} className="btn-primary text-sm px-5 py-2.5 font-semibold">
               Anonymiser →
             </button>
           )}
 
           {step === 'ready' && (
-            <button onClick={handleAnalyze} disabled={!text.trim() || categories.length === 0} className="btn-primary flex items-center gap-2 text-sm px-4 py-1.5">
+            <button onClick={handleAnalyze} disabled={!text.trim() || categories.length === 0} className="btn-primary text-sm px-5 py-2.5 font-semibold">
               Analyser le document
             </button>
           )}

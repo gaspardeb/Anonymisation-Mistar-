@@ -50,7 +50,7 @@ export default function Layout() {
       <aside className="w-64 bg-white border-r border-cream-300 flex flex-col shrink-0">
 
         {/* Brand */}
-        <div className="px-5 py-5 border-b border-cream-200">
+        <div className="px-5 h-[85px] flex flex-col justify-center border-b border-cream-200">
           <p className="font-display text-xl text-ink tracking-tight">MistarAnonyme</p>
           <p className="text-[10px] text-ink-400 mt-0.5 uppercase tracking-widest">Plateforme RGPD</p>
         </div>
